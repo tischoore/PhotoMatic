@@ -8,9 +8,15 @@ use native_windows_gui as nwg;
 use crate::project::{self, ProjectFile};
 use crate::settings::{self, AppConfig};
 use crate::settings_modal;
+use crate::shortcuts::{self, ShortcutAction};
 use crate::window_mode;
 
 const PROJECT_FILTER: &str = "PhotoMatic Project(*.json)";
+
+/// Whether the given virtual key (e.g. `VK_CONTROL`) is currently held down.
+fn key_down(vk: winapi::ctypes::c_int) -> bool {
+    unsafe { winapi::um::winuser::GetKeyState(vk) & 0x8000u16 as i16 != 0 }
+}
 
 #[derive(Default, NwgUi)]
 pub struct App {
@@ -20,50 +26,50 @@ pub struct App {
     current_project_path: RefCell<Option<PathBuf>>,
 
     #[nwg_control(title: "PhotoMatic", flags: "MAIN_WINDOW")]
-    #[nwg_events(OnWindowClose: [App::exit])]
+    #[nwg_events(OnWindowClose: [App::exit], OnKeyPress: [App::on_key_press(SELF, EVT_DATA)])]
     window: nwg::Window,
 
     #[nwg_control]
     #[nwg_events(OnNotice: [App::settings_dialog_closed])]
     settings_notice: nwg::Notice,
 
-    #[nwg_control(parent: window, text: "File")]
+    #[nwg_control(parent: window, text: "&File")]
     file_menu: nwg::Menu,
 
-    #[nwg_control(parent: file_menu, text: "New")]
+    #[nwg_control(parent: file_menu, text: "&New\tCtrl+N")]
     #[nwg_events(OnMenuItemSelected: [App::file_new])]
     file_new: nwg::MenuItem,
 
-    #[nwg_control(parent: file_menu, text: "Load")]
+    #[nwg_control(parent: file_menu, text: "&Open...\tCtrl+O")]
     #[nwg_events(OnMenuItemSelected: [App::file_load])]
     file_load: nwg::MenuItem,
 
-    #[nwg_control(parent: file_menu, text: "Save")]
+    #[nwg_control(parent: file_menu, text: "&Save\tCtrl+S")]
     #[nwg_events(OnMenuItemSelected: [App::file_save])]
     file_save: nwg::MenuItem,
 
-    #[nwg_control(parent: file_menu, text: "Save As")]
+    #[nwg_control(parent: file_menu, text: "Save &As...\tCtrl+Shift+S")]
     #[nwg_events(OnMenuItemSelected: [App::file_save_as])]
     file_save_as: nwg::MenuItem,
 
     #[nwg_control(parent: file_menu)]
     file_menu_sep: nwg::MenuSeparator,
 
-    #[nwg_control(parent: file_menu, text: "Exit")]
+    #[nwg_control(parent: file_menu, text: "E&xit\tAlt+F4")]
     #[nwg_events(OnMenuItemSelected: [App::exit])]
     file_exit: nwg::MenuItem,
 
-    #[nwg_control(parent: window, text: "Edit")]
+    #[nwg_control(parent: window, text: "&Edit")]
     edit_menu: nwg::Menu,
 
-    #[nwg_control(parent: edit_menu, text: "Settings")]
+    #[nwg_control(parent: edit_menu, text: "&Settings...")]
     #[nwg_events(OnMenuItemSelected: [App::open_settings])]
     edit_settings: nwg::MenuItem,
 
-    #[nwg_control(parent: window, text: "Help")]
+    #[nwg_control(parent: window, text: "&Help")]
     help_menu: nwg::Menu,
 
-    #[nwg_control(parent: help_menu, text: "About")]
+    #[nwg_control(parent: help_menu, text: "&About")]
     #[nwg_events(OnMenuItemSelected: [App::show_about])]
     help_about: nwg::MenuItem,
 }
@@ -77,6 +83,22 @@ impl App {
 
     fn exit(&self) {
         nwg::stop_thread_dispatch();
+    }
+
+    /// Dispatches the Ctrl-key accelerators declared in the File menu (Ctrl+N/O/S/Shift+S).
+    /// The virtual-key code comes from the event; modifier state isn't part of `OnKeyPress`, so
+    /// it's read directly from Win32.
+    fn on_key_press(&self, data: &nwg::EventData) {
+        let ctrl = key_down(winapi::um::winuser::VK_CONTROL);
+        let shift = key_down(winapi::um::winuser::VK_SHIFT);
+
+        match shortcuts::resolve(data.on_key(), ctrl, shift) {
+            Some(ShortcutAction::New) => self.file_new(),
+            Some(ShortcutAction::Open) => self.file_load(),
+            Some(ShortcutAction::Save) => self.file_save(),
+            Some(ShortcutAction::SaveAs) => self.file_save_as(),
+            None => {}
+        }
     }
 
     fn file_new(&self) {

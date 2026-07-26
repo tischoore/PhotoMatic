@@ -5,6 +5,7 @@ mod app;
 mod project;
 mod settings;
 mod settings_modal;
+mod shortcuts;
 mod window_mode;
 
 use native_windows_gui as nwg;

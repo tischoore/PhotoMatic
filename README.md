@@ -5,9 +5,10 @@ A native Windows desktop application written in Rust, using [native-windows-gui]
 ## Features
 
 - **Windowed or full-screen** startup mode, based on a saved user preference.
-- **File menu** — `Exit` closes the application.
-- **Edit menu** — `Settings` opens a dialog to switch between Windowed and Full screen, with Accept/Cancel. Accept saves the choice to disk and applies it immediately; Cancel discards the change.
+- **File menu** — `New` (Ctrl+N) resets the current project; `Open...` (Ctrl+O) loads a project from disk; `Save` (Ctrl+S) and `Save As...` (Ctrl+Shift+S) write it back; `Exit` (Alt+F4) closes the application.
+- **Edit menu** — `Settings...` opens a dialog to switch between Windowed and Full screen, with Accept/Cancel. Accept saves the choice to disk and applies it immediately; Cancel discards the change.
 - **Help menu** — `About` shows the application name, author, and year.
+- **Keyboard shortcuts** — every menu has an Alt-mnemonic access key (e.g. Alt+F for File), and the standard Windows accelerators above are wired for real, not just labeled.
 - **Persisted settings** — stored at `%APPDATA%\Tischer\PhotoMatic\config.toml`.
 
 ## Prerequisites
@@ -46,5 +47,6 @@ See `CLAUDE.md` for this project's testing convention (every feature must ship w
 | `src/settings.rs` | Config load/save (`%APPDATA%\Tischer\PhotoMatic\config.toml`). |
 | `src/settings_modal.rs` | The Settings dialog (runs on its own thread, per NWG's recommended dialog pattern). |
 | `src/about_modal.rs` | The About message box. |
+| `src/shortcuts.rs` | Maps Ctrl-key combinations to menu actions (Ctrl+N/O/S/Shift+S), independent of NWG's event system. |
 | `src/window_mode.rs` | Applies windowed vs. full-screen (maximized) mode to the main window. |
 | `build.rs` | Embeds a Windows application manifest (required for native-windows-gui's control subclassing to work at all). |
