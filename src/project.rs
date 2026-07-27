@@ -1,12 +1,46 @@
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// The PhotoMatic project file format (`.json`). Empty for now — paths and other
-/// project data will be added here as features are built.
+/// The PhotoMatic project file format (`.json`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ProjectFile {}
+pub struct ProjectFile {
+    /// The folder photos are imported/read from. `None` until the user sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_directory: Option<PathBuf>,
+
+    /// Which file extensions are included when reading `source_directory`.
+    #[serde(default, skip_serializing_if = "FileExtensions::is_default")]
+    pub file_extensions: FileExtensions,
+}
+
+/// Which file extensions to include from the Source Directory. Defaults to all included.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileExtensions {
+    #[serde(default = "FileExtensions::default_true")]
+    pub jpg: bool,
+    #[serde(default = "FileExtensions::default_true")]
+    pub cr2: bool,
+    #[serde(default = "FileExtensions::default_true")]
+    pub gif: bool,
+}
+
+impl FileExtensions {
+    fn default_true() -> bool {
+        true
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for FileExtensions {
+    fn default() -> Self {
+        FileExtensions { jpg: true, cr2: true, gif: true }
+    }
+}
 
 #[derive(Debug)]
 pub enum ProjectError {
@@ -77,6 +111,41 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
 
         assert_eq!(text.trim(), "{}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn round_trips_source_directory_through_json() {
+        let path = temp_path("project-source-directory.json");
+        let project = ProjectFile {
+            source_directory: Some(std::path::PathBuf::from(r"C:\photos\import")),
+            ..ProjectFile::default()
+        };
+
+        save(&path, &project).unwrap();
+        let loaded = load(&path).unwrap();
+
+        assert_eq!(loaded, project);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_extensions_default_to_all_included() {
+        assert_eq!(FileExtensions::default(), FileExtensions { jpg: true, cr2: true, gif: true });
+    }
+
+    #[test]
+    fn round_trips_file_extensions_through_json() {
+        let path = temp_path("project-file-extensions.json");
+        let project = ProjectFile {
+            source_directory: None,
+            file_extensions: FileExtensions { jpg: true, cr2: false, gif: false },
+        };
+
+        save(&path, &project).unwrap();
+        let loaded = load(&path).unwrap();
+
+        assert_eq!(loaded, project);
         std::fs::remove_file(&path).ok();
     }
 

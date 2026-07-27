@@ -5,6 +5,9 @@ A native Windows desktop application written in Rust, using [native-windows-gui]
 ## Features
 
 - **Windowed or full-screen** startup mode, based on a saved user preference.
+- **Three-region layout** — a full-width Project Information strip (300px tall) across the top, with a Left Navigation panel (1/5 width) and Context Window (4/5 width) filling the rest. Project Information and Left Navigation use a darker gray background; the Context Window is lighter.
+- **Source Directory** — an editable text box plus a `Browse...` folder picker, aligned to the top-left of the Project Information strip. The chosen (or typed) folder is stored in the project file and restored whenever a project is loaded.
+- **File Types** — checkboxes for `*.jpg`, `*.CR2`, and `*.gif`, directly below Source Directory, controlling which file extensions are included from that folder. All are checked by default; the selection is stored in the project file and restored whenever a project is loaded.
 - **File menu** — `New` (Ctrl+N) resets the current project; `Open...` (Ctrl+O) loads a project from disk; `Save` (Ctrl+S) and `Save As...` (Ctrl+Shift+S) write it back; `Exit` (Alt+F4) closes the application.
 - **Edit menu** — `Settings...` opens a dialog to switch between Windowed and Full screen, with Accept/Cancel. Accept saves the choice to disk and applies it immediately; Cancel discards the change.
 - **Help menu** — `About` shows the application name, author, and year.
@@ -43,10 +46,12 @@ See `CLAUDE.md` for this project's testing convention (every feature must ship w
 | File | Purpose |
 |---|---|
 | `src/main.rs` | Entry point: initializes NWG, loads config, builds the UI, runs the event loop. |
-| `src/app.rs` | Main window, menu bar, and event routing. |
+| `src/app.rs` | Main window, menu bar, three-region layout, Source Directory and File Types controls, and event routing. |
+| `src/project.rs` | The project file (`.json`) format and its load/save. |
 | `src/settings.rs` | Config load/save (`%APPDATA%\Tischer\PhotoMatic\config.toml`). |
 | `src/settings_modal.rs` | The Settings dialog (runs on its own thread, per NWG's recommended dialog pattern). |
 | `src/about_modal.rs` | The About message box. |
+| `src/panel_background.rs` | Paints a solid background color on an `nwg::Frame` (used for the Project Information / Left Navigation / Context Window panels). |
 | `src/shortcuts.rs` | Maps Ctrl-key combinations to menu actions (Ctrl+N/O/S/Shift+S), independent of NWG's event system. |
 | `src/window_mode.rs` | Applies windowed vs. full-screen (maximized) mode to the main window. |
 | `build.rs` | Embeds a Windows application manifest (required for native-windows-gui's control subclassing to work at all). |

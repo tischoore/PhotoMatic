@@ -2,6 +2,7 @@
 
 mod about_modal;
 mod app;
+mod panel_background;
 mod project;
 mod settings;
 mod settings_modal;
