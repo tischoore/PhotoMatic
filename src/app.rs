@@ -9,6 +9,7 @@ use nwg::stretch::style::{AlignItems, Dimension as D, FlexDirection, JustifyCont
 
 use crate::panel_background;
 use crate::project::{self, FileExtensions, ProjectFile};
+use crate::scan;
 use crate::settings::{self, AppConfig};
 use crate::settings_modal;
 use crate::shortcuts::{self, ShortcutAction};
@@ -44,6 +45,18 @@ const FILE_TYPE_CHECKBOX_WIDTH: f32 = 80.0;
 /// Vertical gap between the Source Directory and File Types rows.
 const PROJECT_INFO_ROW_GAP: f32 = 8.0;
 
+/// Sizes for the Scan Directory area, pinned to the bottom-right of Project Information.
+const SCAN_BUTTON_WIDTH: f32 = 160.0;
+const SCAN_BUTTON_HEIGHT: f32 = 30.0;
+const SCAN_PROGRESS_HEIGHT: f32 = 8.0;
+/// Vertical gap between the progress bar and the Scan Directory button.
+const SCAN_AREA_GAP: f32 = 6.0;
+
+/// Height of the scan log at the bottom of Left Navigation, sized for ~10 lines of text.
+const SCAN_LOG_HEIGHT: f32 = 180.0;
+/// Number of lines kept in the scan log.
+const SCAN_LOG_MAX_LINES: usize = 10;
+
 /// Whether the given virtual key (e.g. `VK_CONTROL`) is currently held down.
 fn key_down(vk: winapi::ctypes::c_int) -> bool {
     unsafe { winapi::um::winuser::GetKeyState(vk) & 0x8000u16 as i16 != 0 }
@@ -55,6 +68,8 @@ pub struct App {
     settings_thread: RefCell<Option<thread::JoinHandle<Option<bool>>>>,
     project: RefCell<ProjectFile>,
     current_project_path: RefCell<Option<PathBuf>>,
+    scan_thread: RefCell<Option<thread::JoinHandle<scan::ScanResult>>>,
+    scan_log_lines: RefCell<Vec<String>>,
 
     #[nwg_control(title: "PhotoMatic", flags: "MAIN_WINDOW")]
     #[nwg_events(OnWindowClose: [App::exit], OnKeyPress: [App::on_key_press(SELF, EVT_DATA)])]
@@ -63,6 +78,10 @@ pub struct App {
     #[nwg_control]
     #[nwg_events(OnNotice: [App::settings_dialog_closed])]
     settings_notice: nwg::Notice,
+
+    #[nwg_control]
+    #[nwg_events(OnNotice: [App::scan_finished])]
+    scan_notice: nwg::Notice,
 
     #[nwg_control(parent: window, text: "&File")]
     file_menu: nwg::Menu,
@@ -138,11 +157,23 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::sync_file_extensions_from_checkboxes])]
     file_type_gif: nwg::CheckBox,
 
+    #[nwg_control(parent: project_info_frame, flags: "MARQUEE", marquee: true, marquee_update: 30)]
+    scan_progress: nwg::ProgressBar,
+
+    #[nwg_control(parent: project_info_frame, text: "&Scan Directory")]
+    #[nwg_events(OnButtonClick: [App::start_scan])]
+    scan_button: nwg::Button,
+
+    #[nwg_control(parent: nav_frame, text: "", flags: "VISIBLE", readonly: true)]
+    scan_log: nwg::TextBox,
+
     body_layout: nwg::FlexboxLayout,
     root_layout: nwg::FlexboxLayout,
     project_info_layout: nwg::FlexboxLayout,
     source_dir_layout: nwg::FlexboxLayout,
     file_types_layout: nwg::FlexboxLayout,
+    scan_area_layout: nwg::FlexboxLayout,
+    nav_layout: nwg::FlexboxLayout,
 }
 
 impl App {
@@ -179,6 +210,7 @@ impl App {
             .child_size(Size { width: D::Auto, height: D::Points(PROJECT_INFO_HEIGHT) })
             .child_layout(&self.body_layout)
             .child_size(Size { width: D::Auto, height: D::Auto })
+            .child_flex_grow(1.0)
             .build(&self.root_layout)
             .expect("Failed to build the root layout");
 
@@ -218,6 +250,22 @@ impl App {
             .build(&self.file_types_layout)
             .expect("Failed to build the File Types row layout");
 
+        // Progress bar above the Scan Directory button, both pinned to the bottom-right
+        // corner of Project Information via `justify_content`/`align_items: FlexEnd`.
+        let scan_area_margin = Rect { start: D::Points(0.0), end: D::Points(0.0), top: D::Points(0.0), bottom: D::Points(SCAN_AREA_GAP) };
+        nwg::FlexboxLayout::builder()
+            .parent(&self.project_info_frame)
+            .flex_direction(FlexDirection::Column)
+            .justify_content(JustifyContent::FlexEnd)
+            .align_items(AlignItems::FlexEnd)
+            .child(&self.scan_progress)
+            .child_size(Size { width: D::Points(SCAN_BUTTON_WIDTH), height: D::Points(SCAN_PROGRESS_HEIGHT) })
+            .child_margin(scan_area_margin)
+            .child(&self.scan_button)
+            .child_size(Size { width: D::Points(SCAN_BUTTON_WIDTH), height: D::Points(SCAN_BUTTON_HEIGHT) })
+            .build_partial(&self.scan_area_layout)
+            .expect("Failed to build the Scan Directory area layout");
+
         let rows_margin = Rect { start: D::Points(0.0), end: D::Points(0.0), top: D::Points(0.0), bottom: D::Points(PROJECT_INFO_ROW_GAP) };
         nwg::FlexboxLayout::builder()
             .parent(&self.project_info_frame)
@@ -228,8 +276,23 @@ impl App {
             .child_margin(rows_margin)
             .child_layout(&self.file_types_layout)
             .child_size(Size { width: D::Auto, height: D::Points(FILE_TYPES_ROW_HEIGHT) })
+            .child_margin(rows_margin)
+            .child_layout(&self.scan_area_layout)
+            .child_size(Size { width: D::Auto, height: D::Auto })
+            .child_flex_grow(1.0)
             .build(&self.project_info_layout)
             .expect("Failed to build the Project Information column layout");
+
+        // Scan log, pinned to the bottom of the (otherwise empty) Left Navigation panel.
+        nwg::FlexboxLayout::builder()
+            .parent(&self.nav_frame)
+            .flex_direction(FlexDirection::Column)
+            .justify_content(JustifyContent::FlexEnd)
+            .padding(Rect { start: D::Points(8.0), end: D::Points(8.0), top: D::Points(8.0), bottom: D::Points(8.0) })
+            .child(&self.scan_log)
+            .child_size(Size { width: D::Percent(1.0), height: D::Points(SCAN_LOG_HEIGHT) })
+            .build(&self.nav_layout)
+            .expect("Failed to build the Left Navigation layout");
     }
 
     fn exit(&self) {
@@ -445,6 +508,54 @@ impl App {
             nwg::simple_message("PhotoMatic", &format!("Failed to save settings: {err}"));
         }
         window_mode::apply(&self.window, fullscreen);
+    }
+
+    /// Starts a recursive directory scan on a background thread, so the GUI stays responsive.
+    /// Disallows a second concurrent scan while one is already running.
+    fn start_scan(&self) {
+        if self.scan_thread.borrow().is_some() {
+            return;
+        }
+
+        self.sync_source_directory_from_input();
+        let project = self.project.borrow();
+        let Some(root) = project.source_directory.clone() else {
+            nwg::simple_message("PhotoMatic", "Please choose a Source Directory before scanning.");
+            return;
+        };
+        let extensions = project.file_extensions.clone();
+        drop(project);
+
+        self.scan_button.set_enabled(false);
+        self.scan_progress.set_visible(true);
+
+        let sender = self.scan_notice.sender();
+        let handle = thread::spawn(move || {
+            let result = scan::scan_directory(&root, &extensions);
+            sender.notice();
+            result
+        });
+        *self.scan_thread.borrow_mut() = Some(handle);
+    }
+
+    /// Fired via `OnNotice` once the scan thread finishes. Joining is effectively
+    /// non-blocking here since `notice()` is only sent after the thread's work is done.
+    fn scan_finished(&self) {
+        let Some(handle) = self.scan_thread.borrow_mut().take() else {
+            return;
+        };
+        let Ok(result) = handle.join() else {
+            return;
+        };
+
+        self.scan_progress.set_visible(false);
+        self.scan_button.set_enabled(true);
+
+        let extensions = self.project.borrow().file_extensions.clone();
+        let lines = scan::format_summary(&result, &extensions);
+        let mut log = self.scan_log_lines.borrow_mut();
+        scan::append_capped(&mut log, lines, SCAN_LOG_MAX_LINES);
+        self.scan_log.set_text(&log.join("\r\n"));
     }
 }
 
