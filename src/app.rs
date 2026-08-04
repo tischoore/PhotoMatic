@@ -638,9 +638,11 @@ impl App {
 
         // Moved into the closure alongside `root`/`extensions`, same ownership-transfer
         // idiom used above — `rusqlite::Connection` isn't `Sync`, so only one thread
-        // touches it at a time, and folding the DB write into the scan thread avoids a
-        // second thread hop. `db` is `None` until the project has been saved once; the
-        // `.map(...)` below is then a no-op, so scanning before first save still works.
+        // touches it at a time, and folding the DB writes into the scan thread (one
+        // `apply_scan_unit` call per unit as the walk discovers it, so records land
+        // while the scan is still running) avoids a second thread hop. `db` is `None`
+        // until the project has been saved once; the checks above are then a no-op,
+        // so scanning before first save still works.
         let db = self.db.borrow_mut().take();
 
         self.scan_button.set_enabled(false);
@@ -648,11 +650,15 @@ impl App {
 
         let sender = self.scan_notice.sender();
         let handle = thread::spawn(move || {
-            let result = scan::scan_directory(&root, &extensions);
-            let db = db.map(|mut db| {
-                let _ = db.apply_scan(&root, &result);
-                db
+            let mut db = db;
+            let result = scan::scan_directory(&root, &extensions, |unit| {
+                if let Some(db) = db.as_mut() {
+                    let _ = db.apply_scan_unit(unit);
+                }
             });
+            if let Some(db) = db.as_mut() {
+                let _ = db.finish_scan();
+            }
             sender.notice();
             (result, db)
         });

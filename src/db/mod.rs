@@ -48,6 +48,7 @@ impl ProjectDb {
     /// latest schema version.
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let mut conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON")?;
         migrations::apply(&mut conn)?;
         Ok(ProjectDb { conn })
     }
@@ -56,28 +57,30 @@ impl ProjectDb {
         self.conn.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(DbError::Sqlite)
     }
 
-    /// Folds a completed directory scan into the database: upserts `images`/`directories`
-    /// rows and stamps `project_settings.last_scan`. `scan` carries paths already relative
-    /// to `root` (see `scan::ScanResult`); this is where they're normalized to POSIX
-    /// separators and hashed into image keys, at the boundary between the two modules.
-    pub fn apply_scan(&mut self, root: &Path, scan: &scan::ScanResult) -> Result<(), DbError> {
-        let _ = root;
-
-        let scanned_images: Vec<models::ImageRecord> = scan
-            .files
-            .iter()
-            .map(|file| {
-                let path = normalize_path(&file.relative_path);
-                models::ImageRecord { key: images::image_key(&path), path, image_type: file.extension.clone() }
-            })
-            .collect();
-        let dir_names: Vec<String> = scan.dirs.iter().map(|dir| normalize_path(dir)).collect();
-
-        images::upsert_images(&mut self.conn, &scanned_images)?;
-        directories::upsert_directories(&mut self.conn, &dir_names)?;
-        project_settings::update_last_scan(&self.conn, Utc::now())?;
-
+    /// Folds one discovered `ScanUnit` into the database as the scan walks the
+    /// filesystem, so `images`/`directories` rows land while the scan is still
+    /// running rather than only once the whole tree has been walked. For a
+    /// top-level directory, its `directories` row is upserted before its images,
+    /// so the images' `toplevel_dir` foreign key always has a target to point to.
+    pub fn apply_scan_unit(&mut self, unit: &scan::ScanUnit) -> Result<(), DbError> {
+        match unit {
+            scan::ScanUnit::RootFiles(files) => {
+                let images = to_image_records(files, None);
+                images::upsert_images(&mut self.conn, &images)?;
+            }
+            scan::ScanUnit::ToplevelDir { name, files } => {
+                directories::upsert_directories(&mut self.conn, std::slice::from_ref(name))?;
+                let images = to_image_records(files, Some(name.clone()));
+                images::upsert_images(&mut self.conn, &images)?;
+            }
+        }
         Ok(())
+    }
+
+    /// Called once after every `ScanUnit` from a scan has been applied: stamps
+    /// `project_settings.last_scan`.
+    pub fn finish_scan(&self) -> Result<(), DbError> {
+        project_settings::update_last_scan(&self.conn, Utc::now())
     }
 
     // The five methods below have no GUI caller yet — this phase is backend/schema
@@ -121,25 +124,56 @@ fn normalize_path(path: &Path) -> String {
     path.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
 }
 
+/// Maps `ScannedFile`s to `ImageRecord`s: normalizes each path to POSIX separators,
+/// hashes it into a stable image key, and stamps `toplevel_dir`.
+fn to_image_records(files: &[scan::ScannedFile], toplevel_dir: Option<String>) -> Vec<models::ImageRecord> {
+    files
+        .iter()
+        .map(|file| {
+            let path = normalize_path(&file.relative_path);
+            models::ImageRecord {
+                key: images::image_key(&path),
+                path,
+                image_type: file.extension.clone(),
+                toplevel_dir: toplevel_dir.clone(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::{ScanResult, ScannedFile};
+    use crate::scan::{ScanUnit, ScannedFile};
     use std::path::PathBuf;
-    use std::time::Duration;
 
     fn temp_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("photomatic-test-db-{}-{}.sqlite3", std::process::id(), name))
     }
 
-    fn sample_scan() -> ScanResult {
-        ScanResult {
-            files: vec![
-                ScannedFile { relative_path: PathBuf::from("a.jpg"), extension: "jpg".to_string() },
-                ScannedFile { relative_path: PathBuf::from("sub").join("b.cr2"), extension: "cr2".to_string() },
-            ],
-            dirs: vec![PathBuf::from("sub")],
-            elapsed: Duration::from_millis(10),
+    /// Mirrors what `scan::scan_directory` would report for a root containing
+    /// `a.jpg` directly, plus a `sub` directory containing `b.cr2`.
+    fn sample_units() -> Vec<ScanUnit> {
+        vec![
+            ScanUnit::RootFiles(vec![ScannedFile {
+                relative_path: PathBuf::from("a.jpg"),
+                extension: "jpg".to_string(),
+                toplevel_dir: None,
+            }]),
+            ScanUnit::ToplevelDir {
+                name: "sub".to_string(),
+                files: vec![ScannedFile {
+                    relative_path: PathBuf::from("sub").join("b.cr2"),
+                    extension: "cr2".to_string(),
+                    toplevel_dir: Some("sub".to_string()),
+                }],
+            },
+        ]
+    }
+
+    fn apply_units(db: &mut ProjectDb, units: &[ScanUnit]) {
+        for unit in units {
+            db.apply_scan_unit(unit).unwrap();
         }
     }
 
@@ -151,7 +185,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
 
         std::fs::remove_file(&path).ok();
     }
@@ -172,17 +206,19 @@ mod tests {
     }
 
     #[test]
-    fn apply_scan_inserts_images_and_directories() {
+    fn apply_scan_unit_inserts_images_and_directories() {
         let path = temp_db_path("apply-scan-insert");
         std::fs::remove_file(&path).ok();
         let mut db = ProjectDb::open(&path).unwrap();
 
-        db.apply_scan(Path::new("root"), &sample_scan()).unwrap();
+        apply_units(&mut db, &sample_units());
 
         let images = db.list_images().unwrap();
         assert_eq!(images.len(), 2);
-        assert!(images.iter().any(|i| i.path == "a.jpg" && i.image_type == "jpg"));
-        assert!(images.iter().any(|i| i.path == "sub/b.cr2" && i.image_type == "cr2"));
+        assert!(images.iter().any(|i| i.path == "a.jpg" && i.image_type == "jpg" && i.toplevel_dir.is_none()));
+        assert!(images.iter().any(|i| {
+            i.path == "sub/b.cr2" && i.image_type == "cr2" && i.toplevel_dir == Some("sub".to_string())
+        }));
 
         let dirs = db.list_directories().unwrap();
         assert_eq!(dirs.len(), 1);
@@ -193,13 +229,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_scan_twice_with_identical_result_does_not_duplicate_rows() {
+    fn apply_scan_unit_twice_with_identical_units_does_not_duplicate_rows() {
         let path = temp_db_path("apply-scan-twice");
         std::fs::remove_file(&path).ok();
         let mut db = ProjectDb::open(&path).unwrap();
 
-        db.apply_scan(Path::new("root"), &sample_scan()).unwrap();
-        db.apply_scan(Path::new("root"), &sample_scan()).unwrap();
+        apply_units(&mut db, &sample_units());
+        apply_units(&mut db, &sample_units());
 
         assert_eq!(db.list_images().unwrap().len(), 2);
         assert_eq!(db.list_directories().unwrap().len(), 1);
@@ -213,12 +249,12 @@ mod tests {
         std::fs::remove_file(&path).ok();
         let mut db = ProjectDb::open(&path).unwrap();
 
-        db.apply_scan(Path::new("root"), &sample_scan()).unwrap();
+        apply_units(&mut db, &sample_units());
         db.update_directory_metadata("sub", "Jane", "Canon").unwrap();
 
-        let mut second_scan = sample_scan();
-        second_scan.dirs.push(PathBuf::from("new_dir"));
-        db.apply_scan(Path::new("root"), &second_scan).unwrap();
+        let mut second_units = sample_units();
+        second_units.push(ScanUnit::ToplevelDir { name: "new_dir".to_string(), files: vec![] });
+        apply_units(&mut db, &second_units);
 
         let dirs = db.list_directories().unwrap();
         let sub = dirs.iter().find(|d| d.dir_name == "sub").unwrap();
@@ -233,13 +269,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_scan_updates_last_scan_timestamp() {
-        let path = temp_db_path("apply-scan-last-scan");
+    fn finish_scan_updates_last_scan_timestamp_but_apply_scan_unit_alone_does_not() {
+        let path = temp_db_path("finish-scan-last-scan");
         std::fs::remove_file(&path).ok();
         let mut db = ProjectDb::open(&path).unwrap();
 
         assert!(db.project_settings().unwrap().last_scan.is_none());
-        db.apply_scan(Path::new("root"), &sample_scan()).unwrap();
+        apply_units(&mut db, &sample_units());
+        assert!(db.project_settings().unwrap().last_scan.is_none());
+
+        db.finish_scan().unwrap();
         assert!(db.project_settings().unwrap().last_scan.is_some());
 
         std::fs::remove_file(&path).ok();

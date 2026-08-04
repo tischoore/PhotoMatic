@@ -10,19 +10,20 @@ pub fn image_key(path: &str) -> String {
     format!("{:016x}", xxh3_64(path.as_bytes()))
 }
 
-/// Inserts or refreshes `images` rows. Unconditionally overwrites `path`/`image_type`
-/// for a known key — there's no user-entered data on this table to protect.
+/// Inserts or refreshes `images` rows. Unconditionally overwrites `path`/`image_type`/
+/// `toplevel_dir` for a known key — there's no user-entered data on this table to protect.
 pub fn upsert_images(conn: &mut Connection, images: &[ImageRecord]) -> Result<(), DbError> {
     let tx = conn.transaction().map_err(DbError::Sqlite)?;
     {
         let mut stmt = tx
             .prepare(
-                "INSERT INTO images (key, path, image_type) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(key) DO UPDATE SET path = excluded.path, image_type = excluded.image_type",
+                "INSERT INTO images (key, path, image_type, toplevel_dir) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(key) DO UPDATE SET path = excluded.path, image_type = excluded.image_type,
+                 toplevel_dir = excluded.toplevel_dir",
             )
             .map_err(DbError::Sqlite)?;
         for image in images {
-            stmt.execute(rusqlite::params![image.key, image.path, image.image_type])
+            stmt.execute(rusqlite::params![image.key, image.path, image.image_type, image.toplevel_dir])
                 .map_err(DbError::Sqlite)?;
         }
     }
@@ -32,11 +33,16 @@ pub fn upsert_images(conn: &mut Connection, images: &[ImageRecord]) -> Result<()
 
 pub fn list_images(conn: &Connection) -> Result<Vec<ImageRecord>, DbError> {
     let mut stmt = conn
-        .prepare("SELECT key, path, image_type FROM images ORDER BY path")
+        .prepare("SELECT key, path, image_type, toplevel_dir FROM images ORDER BY path")
         .map_err(DbError::Sqlite)?;
     let rows = stmt
         .query_map([], |row| {
-            Ok(ImageRecord { key: row.get(0)?, path: row.get(1)?, image_type: row.get(2)? })
+            Ok(ImageRecord {
+                key: row.get(0)?,
+                path: row.get(1)?,
+                image_type: row.get(2)?,
+                toplevel_dir: row.get(3)?,
+            })
         })
         .map_err(DbError::Sqlite)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Sqlite)

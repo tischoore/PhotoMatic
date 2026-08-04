@@ -16,6 +16,9 @@ pub struct ImageRecord {
     pub key: String,
     pub path: String,
     pub image_type: String,
+    /// The top-level directory (`directories.dir_name`) this image lives under.
+    /// `None` if the image sits directly in the project root.
+    pub toplevel_dir: Option<String>,
 }
 
 /// A row in the `directories` table.
