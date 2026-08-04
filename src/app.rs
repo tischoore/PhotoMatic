@@ -8,6 +8,8 @@ use nwg::stretch::geometry::{Rect, Size};
 use nwg::stretch::style::{AlignItems, Dimension as D, FlexDirection, JustifyContent};
 
 use crate::db;
+use crate::explorer;
+use crate::nav_tree;
 use crate::panel_background;
 use crate::project::{self, FileExtensions, ProjectFile};
 use crate::scan;
@@ -63,6 +65,35 @@ fn key_down(vk: winapi::ctypes::c_int) -> bool {
     unsafe { winapi::um::winuser::GetKeyState(vk) & 0x8000u16 as i16 != 0 }
 }
 
+/// Finds the tree item under the current cursor position, if any. `nwg::TreeView`
+/// exposes no "item under a point" query of its own, so this sends `TVM_HITTEST`
+/// directly to the control's `HWND` — the same low-level-winapi-call pattern
+/// `key_down` above uses for modifier keys, needed here because right-clicking a
+/// Win32 tree view doesn't move its selection the way a left click does.
+fn tree_hit_test_at_cursor(tree: &nwg::TreeView) -> Option<nwg::TreeItem> {
+    use winapi::shared::windef::POINT;
+    use winapi::um::commctrl::{TVHITTESTINFO, TVHT_ONITEM, TVM_HITTEST};
+
+    let hwnd = tree.handle.hwnd()?;
+    let (x, y) = nwg::GlobalCursor::local_position(tree, None);
+
+    let mut hit_test = TVHITTESTINFO { pt: POINT { x, y }, flags: 0, hItem: std::ptr::null_mut() };
+    unsafe {
+        winapi::um::winuser::SendMessageW(
+            hwnd,
+            TVM_HITTEST,
+            0,
+            &mut hit_test as *mut TVHITTESTINFO as isize,
+        );
+    }
+
+    if hit_test.hItem.is_null() || hit_test.flags & TVHT_ONITEM == 0 {
+        None
+    } else {
+        Some(nwg::TreeItem { handle: hit_test.hItem })
+    }
+}
+
 #[derive(Default, NwgUi)]
 pub struct App {
     config: RefCell<AppConfig>,
@@ -73,6 +104,10 @@ pub struct App {
     scan_log_lines: RefCell<Vec<String>>,
     db: RefCell<Option<db::ProjectDb>>,
     db_open_thread: RefCell<Option<thread::JoinHandle<Result<db::ProjectDb, db::DbError>>>>,
+    /// The top-level directory right-clicked in `nav_tree`, remembered between
+    /// `nav_tree_right_click` (which shows `nav_tree_menu`) and
+    /// `open_selected_dir_in_explorer` (the menu's only item).
+    nav_tree_context_dir: RefCell<Option<String>>,
 
     #[nwg_control(title: "PhotoMatic", flags: "MAIN_WINDOW")]
     #[nwg_events(OnWindowClose: [App::exit], OnKeyPress: [App::on_key_press(SELF, EVT_DATA)])]
@@ -171,8 +206,19 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::start_scan])]
     scan_button: nwg::Button,
 
+    #[nwg_control(parent: nav_frame, flags: "VISIBLE")]
+    #[nwg_events(OnTreeViewRightClick: [App::nav_tree_right_click])]
+    nav_tree: nwg::TreeView,
+
     #[nwg_control(parent: nav_frame, text: "", flags: "VISIBLE", readonly: true)]
     scan_log: nwg::TextBox,
+
+    #[nwg_control(parent: window, popup: true)]
+    nav_tree_menu: nwg::Menu,
+
+    #[nwg_control(parent: nav_tree_menu, text: "&Open in Explorer")]
+    #[nwg_events(OnMenuItemSelected: [App::open_selected_dir_in_explorer])]
+    nav_tree_menu_open_explorer: nwg::MenuItem,
 
     body_layout: nwg::FlexboxLayout,
     root_layout: nwg::FlexboxLayout,
@@ -290,12 +336,14 @@ impl App {
             .build(&self.project_info_layout)
             .expect("Failed to build the Project Information column layout");
 
-        // Scan log, pinned to the bottom of the (otherwise empty) Left Navigation panel.
+        // Directory tree fills the space above the scan log, which stays pinned to the bottom.
         nwg::FlexboxLayout::builder()
             .parent(&self.nav_frame)
             .flex_direction(FlexDirection::Column)
-            .justify_content(JustifyContent::FlexEnd)
             .padding(Rect { start: D::Points(8.0), end: D::Points(8.0), top: D::Points(8.0), bottom: D::Points(8.0) })
+            .child(&self.nav_tree)
+            .child_size(Size { width: D::Percent(1.0), height: D::Auto })
+            .child_flex_grow(1.0)
             .child(&self.scan_log)
             .child_size(Size { width: D::Percent(1.0), height: D::Points(SCAN_LOG_HEIGHT) })
             .build(&self.nav_layout)
@@ -328,6 +376,7 @@ impl App {
         *self.db.borrow_mut() = None;
         self.source_dir_input.set_text("");
         self.set_file_type_checkboxes(&FileExtensions::default());
+        self.nav_tree.clear();
     }
 
     fn file_load(&self) {
@@ -405,10 +454,61 @@ impl App {
                     self.sync_database_metadata(&db);
                 }
                 *self.db.borrow_mut() = Some(db);
+                self.refresh_nav_tree();
             }
             Err(err) => {
                 nwg::simple_message("PhotoMatic", &format!("Failed to open project database: {err}"));
             }
+        }
+    }
+
+    /// Rebuilds `nav_tree` from the database's current `directories`/`images` rows:
+    /// one root node per top-level directory, sorted, each with fixed `jpg`/`cr2`/`gif`
+    /// count children. Called whenever the database changes under the tree — after a
+    /// project load and after a scan — so the tree never drifts from what's stored.
+    fn refresh_nav_tree(&self) {
+        self.nav_tree.clear();
+
+        let db = self.db.borrow();
+        let Some(db) = db.as_ref() else { return };
+        let (Ok(dirs), Ok(counts)) = (db.list_directories(), db.directory_type_counts()) else { return };
+
+        for node in nav_tree::build(&dirs, &counts) {
+            let dir_item = self.nav_tree.insert_item(&node.dir_name, None, nwg::TreeInsert::Sort);
+            for (ext, count) in &node.type_counts {
+                self.nav_tree.insert_item(&format!("{ext} ({count})"), Some(&dir_item), nwg::TreeInsert::Last);
+            }
+            // Expanded by default so the type counts are visible without an extra click —
+            // that's the whole point of putting them in the tree.
+            self.nav_tree.set_expand_state(&dir_item, nwg::ExpandState::Expand);
+        }
+    }
+
+    /// Fired via `OnTreeViewRightClick`. `nwg::TreeView` doesn't change selection on a
+    /// right click and has no "item under cursor" query, so the item is found with a
+    /// manual `TVM_HITTEST` at the current cursor position. Only top-level directory
+    /// nodes (no parent) get the context menu — the `jpg (n)`/`cr2 (n)`/`gif (n)`
+    /// children don't have a folder of their own to open.
+    fn nav_tree_right_click(&self) {
+        let Some(item) = tree_hit_test_at_cursor(&self.nav_tree) else { return };
+        if self.nav_tree.parent(&item).is_some() {
+            return;
+        }
+
+        *self.nav_tree_context_dir.borrow_mut() = self.nav_tree.item_text(&item);
+        let (x, y) = nwg::GlobalCursor::position();
+        self.nav_tree_menu.popup(x, y);
+    }
+
+    /// The `nav_tree_menu`'s only item: opens Windows Explorer at the top-level
+    /// directory last right-clicked in `nav_tree` (recorded by `nav_tree_right_click`).
+    fn open_selected_dir_in_explorer(&self) {
+        let Some(dir_name) = self.nav_tree_context_dir.borrow_mut().take() else { return };
+        let Some(source_dir) = self.project.borrow().source_directory.clone() else { return };
+
+        let path = explorer::resolve_path(&source_dir, &dir_name);
+        if let Err(err) = explorer::open(&path) {
+            nwg::simple_message("PhotoMatic", &format!("Failed to open Explorer: {err}"));
         }
     }
 
@@ -681,6 +781,7 @@ impl App {
         if let Some(db) = db {
             self.sync_database_metadata(&db);
             *self.db.borrow_mut() = Some(db);
+            self.refresh_nav_tree();
         }
 
         let extensions = self.project.borrow().file_extensions.clone();

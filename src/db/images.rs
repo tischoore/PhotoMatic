@@ -48,6 +48,19 @@ pub fn list_images(conn: &Connection) -> Result<Vec<ImageRecord>, DbError> {
     rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Sqlite)
 }
 
+/// Counts images grouped by top-level directory and extension, for the Left
+/// Navigation tree. `toplevel_dir` is `None` for the group of images sitting
+/// directly in the Source Directory.
+pub fn count_by_directory_and_type(conn: &Connection) -> Result<Vec<(Option<String>, String, i64)>, DbError> {
+    let mut stmt = conn
+        .prepare("SELECT toplevel_dir, image_type, COUNT(*) FROM images GROUP BY toplevel_dir, image_type")
+        .map_err(DbError::Sqlite)?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map_err(DbError::Sqlite)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Sqlite)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

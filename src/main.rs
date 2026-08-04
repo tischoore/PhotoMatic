@@ -3,6 +3,8 @@
 mod about_modal;
 mod app;
 mod db;
+mod explorer;
+mod nav_tree;
 mod panel_background;
 mod project;
 mod scan;

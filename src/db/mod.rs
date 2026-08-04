@@ -116,6 +116,11 @@ impl ProjectDb {
     pub fn list_images(&self) -> Result<Vec<models::ImageRecord>, DbError> {
         images::list_images(&self.conn)
     }
+
+    /// Per-directory, per-extension image counts backing the Left Navigation tree.
+    pub fn directory_type_counts(&self) -> Result<Vec<(Option<String>, String, i64)>, DbError> {
+        images::count_by_directory_and_type(&self.conn)
+    }
 }
 
 /// Normalizes a relative path to forward-slash (POSIX) separators, regardless of the
@@ -280,6 +285,22 @@ mod tests {
 
         db.finish_scan().unwrap();
         assert!(db.project_settings().unwrap().last_scan.is_some());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn directory_type_counts_groups_by_directory_and_extension() {
+        let path = temp_db_path("directory-type-counts");
+        std::fs::remove_file(&path).ok();
+        let mut db = ProjectDb::open(&path).unwrap();
+
+        apply_units(&mut db, &sample_units());
+
+        let counts = db.directory_type_counts().unwrap();
+        assert_eq!(counts.len(), 2);
+        assert!(counts.contains(&(None, "jpg".to_string(), 1)));
+        assert!(counts.contains(&(Some("sub".to_string()), "cr2".to_string(), 1)));
 
         std::fs::remove_file(&path).ok();
     }
