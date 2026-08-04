@@ -9,6 +9,7 @@ A native Windows desktop application written in Rust, using [native-windows-gui]
 - **Source Directory** — an editable text box plus a `Browse...` folder picker, aligned to the top-left of the Project Information strip. The chosen (or typed) folder is stored in the project file and restored whenever a project is loaded.
 - **File Types** — checkboxes for `*.jpg`, `*.CR2`, and `*.gif`, directly below Source Directory, controlling which file extensions are included from that folder. All are checked by default; the selection is stored in the project file and restored whenever a project is loaded.
 - **Scan Directory** — a button pinned to the bottom-right of the Project Information strip. Recursively walks the Source Directory on a background thread (so the rest of the GUI stays responsive), counting files matching the enabled File Types. While scanning, the button is disabled and a marquee progress bar above it is shown. When the scan finishes, a line per enabled file type (with its count) plus the elapsed time is added to a 10-line, read-only scan log at the bottom of the Left Navigation panel.
+- **Project database** — alongside the JSON project file, a SQLite database (`<name>.sqlite3` next to `<name>.json`) is created on first save and migrated forward automatically every time it's opened. Each Scan Directory run records a row per found file (keyed by a stable hash of its path) and per found directory, without duplicating existing rows or overwriting any per-directory metadata a later editing UI adds.
 - **File menu** — `New` (Ctrl+N) resets the current project; `Open...` (Ctrl+O) loads a project from disk; `Save` (Ctrl+S) and `Save As...` (Ctrl+Shift+S) write it back; `Exit` (Alt+F4) closes the application.
 - **Edit menu** — `Settings...` opens a dialog to switch between Windowed and Full screen, with Accept/Cancel. Accept saves the choice to disk and applies it immediately; Cancel discards the change.
 - **Help menu** — `About` shows the application name, author, and year.
@@ -19,6 +20,7 @@ A native Windows desktop application written in Rust, using [native-windows-gui]
 
 - **Rust** (stable, MSVC toolchain) — install via [rustup](https://rustup.rs). The pinned toolchain is in `rust-toolchain.toml`, so `rustup` will fetch it automatically on first build.
 - **MSVC linker** — install the "Desktop development with C++" workload from [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio). Without this, the build fails with `linker 'link.exe' not found`.
+- **SQLite** — statically bundled into the executable via `rusqlite`'s `bundled` feature, so there's nothing separate to install. The first build compiles SQLite from source using the same MSVC toolchain, so expect a slower first build.
 
 ## Build and run
 
@@ -48,8 +50,14 @@ See `CLAUDE.md` for this project's testing convention (every feature must ship w
 |---|---|
 | `src/main.rs` | Entry point: initializes NWG, loads config, builds the UI, runs the event loop. |
 | `src/app.rs` | Main window, menu bar, three-region layout, Source Directory and File Types controls, and event routing. |
-| `src/project.rs` | The project file (`.json`) format and its load/save. |
-| `src/scan.rs` | Recursive image-file counting by extension, and scan-summary/log formatting — pure logic, unit-tested independently of the GUI. |
+| `src/project.rs` | The project file (`.json`) format and its load/save. Also carries the project database's path, cached schema version, and last-modified timestamp. |
+| `src/scan.rs` | Recursive image-file/directory collection, per-extension counting, and scan-summary/log formatting — pure logic, unit-tested independently of the GUI and with no knowledge of the database. |
+| `src/db/mod.rs` | `ProjectDb`: opens/migrates the project's SQLite database and orchestrates folding a scan's results into it. |
+| `src/db/migrations.rs` | The embedded migration list and `apply()`, run via `rusqlite_migration` against `PRAGMA user_version`. |
+| `src/db/models.rs` | `ProjectSettings`, `ImageRecord`, `DirectoryRecord` — plain structs mirroring the database's tables. |
+| `src/db/project_settings.rs` | Get/update queries for the singleton `project_settings` row. |
+| `src/db/images.rs` | Upsert/list queries for the `images` table, plus the pure `image_key()` (xxh3) hash function. |
+| `src/db/directories.rs` | Upsert/list queries for the `directories` table, plus `update_directory_metadata()` for a later editing UI. |
 | `src/settings.rs` | Config load/save (`%APPDATA%\Tischer\PhotoMatic\config.toml`). |
 | `src/settings_modal.rs` | The Settings dialog (runs on its own thread, per NWG's recommended dialog pattern). |
 | `src/about_modal.rs` | The About message box. |

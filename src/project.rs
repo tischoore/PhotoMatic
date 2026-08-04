@@ -13,6 +13,22 @@ pub struct ProjectFile {
     /// Which file extensions are included when reading `source_directory`.
     #[serde(default, skip_serializing_if = "FileExtensions::is_default")]
     pub file_extensions: FileExtensions,
+
+    /// Path to this project's SQLite database, relative to the project .json file's own
+    /// directory (keeps the project folder portable if moved/copied together). `None`
+    /// until the project has been saved for the first time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_path: Option<PathBuf>,
+
+    /// Cached copy of the database's PRAGMA user_version as of the last time this app
+    /// opened/migrated it. Informational only — the database is authoritative; refreshed
+    /// every time the DB is opened or migrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_schema_version: Option<i64>,
+
+    /// When the database was last written to (e.g. after a scan committed rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_last_modified: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Which file extensions to include from the Source Directory. Defaults to all included.
@@ -140,12 +156,36 @@ mod tests {
         let project = ProjectFile {
             source_directory: None,
             file_extensions: FileExtensions { jpg: true, cr2: false, gif: false },
+            ..ProjectFile::default()
         };
 
         save(&path, &project).unwrap();
         let loaded = load(&path).unwrap();
 
         assert_eq!(loaded, project);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn round_trips_database_fields_through_json_and_omits_them_when_none() {
+        let path = temp_path("project-database-fields.json");
+        let project = ProjectFile {
+            database_path: Some(PathBuf::from("myproject.sqlite3")),
+            database_schema_version: Some(1),
+            database_last_modified: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-08-03T12:00:00Z").unwrap().with_timezone(&chrono::Utc),
+            ),
+            ..ProjectFile::default()
+        };
+
+        save(&path, &project).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded, project);
+
+        save(&path, &ProjectFile::default()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.trim(), "{}");
+
         std::fs::remove_file(&path).ok();
     }
 

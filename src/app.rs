@@ -7,6 +7,7 @@ use native_windows_gui as nwg;
 use nwg::stretch::geometry::{Rect, Size};
 use nwg::stretch::style::{AlignItems, Dimension as D, FlexDirection, JustifyContent};
 
+use crate::db;
 use crate::panel_background;
 use crate::project::{self, FileExtensions, ProjectFile};
 use crate::scan;
@@ -68,8 +69,10 @@ pub struct App {
     settings_thread: RefCell<Option<thread::JoinHandle<Option<bool>>>>,
     project: RefCell<ProjectFile>,
     current_project_path: RefCell<Option<PathBuf>>,
-    scan_thread: RefCell<Option<thread::JoinHandle<scan::ScanResult>>>,
+    scan_thread: RefCell<Option<thread::JoinHandle<(scan::ScanResult, Option<db::ProjectDb>)>>>,
     scan_log_lines: RefCell<Vec<String>>,
+    db: RefCell<Option<db::ProjectDb>>,
+    db_open_thread: RefCell<Option<thread::JoinHandle<Result<db::ProjectDb, db::DbError>>>>,
 
     #[nwg_control(title: "PhotoMatic", flags: "MAIN_WINDOW")]
     #[nwg_events(OnWindowClose: [App::exit], OnKeyPress: [App::on_key_press(SELF, EVT_DATA)])]
@@ -82,6 +85,10 @@ pub struct App {
     #[nwg_control]
     #[nwg_events(OnNotice: [App::scan_finished])]
     scan_notice: nwg::Notice,
+
+    #[nwg_control]
+    #[nwg_events(OnNotice: [App::db_open_finished])]
+    db_notice: nwg::Notice,
 
     #[nwg_control(parent: window, text: "&File")]
     file_menu: nwg::Menu,
@@ -318,6 +325,7 @@ impl App {
     fn file_new(&self) {
         *self.project.borrow_mut() = ProjectFile::default();
         *self.current_project_path.borrow_mut() = None;
+        *self.db.borrow_mut() = None;
         self.source_dir_input.set_text("");
         self.set_file_type_checkboxes(&FileExtensions::default());
     }
@@ -339,16 +347,84 @@ impl App {
         match project::load(&path) {
             Ok(loaded) => {
                 let source_dir = loaded.source_directory.clone();
+                let database_path = loaded.database_path.clone();
                 self.set_file_type_checkboxes(&loaded.file_extensions);
                 *self.project.borrow_mut() = loaded;
                 *self.current_project_path.borrow_mut() = Some(path.clone());
                 self.source_dir_input.set_text(
                     source_dir.map(|dir| dir.to_string_lossy().into_owned()).as_deref().unwrap_or(""),
                 );
-                self.remember_recent_path(path);
+                self.remember_recent_path(path.clone());
+
+                *self.db.borrow_mut() = None;
+                if let Some(relative) = database_path {
+                    let absolute = path.parent().map(|parent| parent.join(&relative)).unwrap_or(relative);
+                    self.start_db_open(absolute);
+                }
             }
             Err(err) => {
                 nwg::simple_message("PhotoMatic", &format!("Failed to load project: {err}"));
+            }
+        }
+    }
+
+    /// Opens (and migrates) the project database at `database_path` on a background
+    /// thread, so a large migration can't stall the GUI thread. Disallows a second
+    /// concurrent open, mirroring `start_scan`'s guard against overlapping scans.
+    fn start_db_open(&self, database_path: PathBuf) {
+        if self.db_open_thread.borrow().is_some() {
+            return;
+        }
+
+        let sender = self.db_notice.sender();
+        let handle = thread::spawn(move || {
+            let result = db::ProjectDb::open(&database_path);
+            sender.notice();
+            result
+        });
+        *self.db_open_thread.borrow_mut() = Some(handle);
+    }
+
+    /// Fired via `OnNotice` once the background database-open thread finishes (started
+    /// by `start_db_open` from `file_load`). Stores the opened `ProjectDb` and, if its
+    /// post-migration schema version differs from the JSON's cached value, updates and
+    /// re-saves the JSON so the cache never lags a migration that already ran. Failure
+    /// is reported without blocking use of the rest of the loaded project.
+    fn db_open_finished(&self) {
+        let Some(handle) = self.db_open_thread.borrow_mut().take() else {
+            return;
+        };
+        let Ok(result) = handle.join() else {
+            return;
+        };
+
+        match result {
+            Ok(db) => {
+                let cached_version = self.project.borrow().database_schema_version;
+                if db.schema_version().ok() != cached_version {
+                    self.sync_database_metadata(&db);
+                }
+                *self.db.borrow_mut() = Some(db);
+            }
+            Err(err) => {
+                nwg::simple_message("PhotoMatic", &format!("Failed to open project database: {err}"));
+            }
+        }
+    }
+
+    /// Refreshes the project's cached `database_schema_version`/`database_last_modified`
+    /// fields from `db`'s current state and re-saves the project file. Only called once a
+    /// `ProjectDb` exists, which only happens after the project has been saved at least
+    /// once, so `current_project_path` is always set here.
+    fn sync_database_metadata(&self, db: &db::ProjectDb) {
+        {
+            let mut project = self.project.borrow_mut();
+            project.database_schema_version = db.schema_version().ok();
+            project.database_last_modified = Some(chrono::Utc::now());
+        }
+        if let Some(path) = self.current_project_path.borrow().clone() {
+            if let Err(err) = project::save(&path, &self.project.borrow()) {
+                nwg::simple_message("PhotoMatic", &format!("Failed to save project: {err}"));
             }
         }
     }
@@ -380,6 +456,7 @@ impl App {
 
     fn save_project_to(&self, path: &Path) {
         self.sync_source_directory_from_input();
+        self.ensure_database_provisioned(path);
 
         match project::save(path, &self.project.borrow()) {
             Ok(()) => {
@@ -388,6 +465,39 @@ impl App {
             }
             Err(err) => {
                 nwg::simple_message("PhotoMatic", &format!("Failed to save project: {err}"));
+            }
+        }
+    }
+
+    /// Creates the project's sibling `.sqlite3` database on first save (same stem as
+    /// `path`, `.sqlite3` extension), migrating it to the latest schema and caching its
+    /// version/timestamp on the project. Subsequent saves reuse the existing
+    /// `database_path`, since this is a no-op once it's `Some`.
+    fn ensure_database_provisioned(&self, path: &Path) {
+        if self.project.borrow().database_path.is_some() {
+            return;
+        }
+
+        let db_path = path.with_extension("sqlite3");
+        match db::ProjectDb::open(&db_path) {
+            Ok(db) => {
+                let version = db.schema_version().ok();
+                let relative = path
+                    .parent()
+                    .and_then(|parent| db_path.strip_prefix(parent).ok())
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| db_path.clone());
+
+                let mut project = self.project.borrow_mut();
+                project.database_path = Some(relative);
+                project.database_schema_version = version;
+                project.database_last_modified = Some(chrono::Utc::now());
+                drop(project);
+
+                *self.db.borrow_mut() = Some(db);
+            }
+            Err(err) => {
+                nwg::simple_message("PhotoMatic", &format!("Failed to create project database: {err}"));
             }
         }
     }
@@ -526,14 +636,25 @@ impl App {
         let extensions = project.file_extensions.clone();
         drop(project);
 
+        // Moved into the closure alongside `root`/`extensions`, same ownership-transfer
+        // idiom used above — `rusqlite::Connection` isn't `Sync`, so only one thread
+        // touches it at a time, and folding the DB write into the scan thread avoids a
+        // second thread hop. `db` is `None` until the project has been saved once; the
+        // `.map(...)` below is then a no-op, so scanning before first save still works.
+        let db = self.db.borrow_mut().take();
+
         self.scan_button.set_enabled(false);
         self.scan_progress.set_visible(true);
 
         let sender = self.scan_notice.sender();
         let handle = thread::spawn(move || {
             let result = scan::scan_directory(&root, &extensions);
+            let db = db.map(|mut db| {
+                let _ = db.apply_scan(&root, &result);
+                db
+            });
             sender.notice();
-            result
+            (result, db)
         });
         *self.scan_thread.borrow_mut() = Some(handle);
     }
@@ -544,12 +665,17 @@ impl App {
         let Some(handle) = self.scan_thread.borrow_mut().take() else {
             return;
         };
-        let Ok(result) = handle.join() else {
+        let Ok((result, db)) = handle.join() else {
             return;
         };
 
         self.scan_progress.set_visible(false);
         self.scan_button.set_enabled(true);
+
+        if let Some(db) = db {
+            self.sync_database_metadata(&db);
+            *self.db.borrow_mut() = Some(db);
+        }
 
         let extensions = self.project.borrow().file_extensions.clone();
         let lines = scan::format_summary(&result, &extensions);

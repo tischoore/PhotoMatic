@@ -2,6 +2,7 @@
 
 mod about_modal;
 mod app;
+mod db;
 mod panel_background;
 mod project;
 mod scan;

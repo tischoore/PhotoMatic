@@ -9,6 +9,10 @@ native-windows-derive = "1.0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 winapi = { version = "0.3", features = ["combaseapi", "objbase", "winuser", "wingdi"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "chrono"] }
+rusqlite_migration = "2.6.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 [build-dependencies]
 embed-manifest = "1"
