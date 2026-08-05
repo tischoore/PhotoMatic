@@ -1,8 +1,7 @@
 use crate::db::models::DirectoryRecord;
 
 /// The fixed, ordered set of extensions every directory node in the Left
-/// Navigation tree shows a count for, matching the File Types checkboxes and
-/// `scan::ScanCounts`.
+/// Navigation tree shows a count for, matching the File Types checkboxes.
 const TYPES: [&str; 3] = ["jpg", "cr2", "gif"];
 
 /// One top-level directory node in the Left Navigation tree, with its per-type

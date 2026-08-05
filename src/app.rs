@@ -21,7 +21,7 @@ use crate::window_mode;
 const PROJECT_FILTER: &str = "PhotoMatic Project(*.json)";
 
 /// Height of the Project Information strip, in points (`FlexboxLayout` units).
-const PROJECT_INFO_HEIGHT: f32 = 300.0;
+const PROJECT_INFO_HEIGHT: f32 = 150.0;
 /// Width of the Left Navigation panel, as a fraction of the space below Project Information.
 const NAV_WIDTH_PERCENT: f32 = 0.2;
 /// Width of the Context Window, as a fraction of the space below Project Information.
@@ -54,11 +54,6 @@ const SCAN_BUTTON_HEIGHT: f32 = 30.0;
 const SCAN_PROGRESS_HEIGHT: f32 = 8.0;
 /// Vertical gap between the progress bar and the Scan Directory button.
 const SCAN_AREA_GAP: f32 = 6.0;
-
-/// Height of the scan log at the bottom of Left Navigation, sized for ~10 lines of text.
-const SCAN_LOG_HEIGHT: f32 = 180.0;
-/// Number of lines kept in the scan log.
-const SCAN_LOG_MAX_LINES: usize = 10;
 
 /// Whether the given virtual key (e.g. `VK_CONTROL`) is currently held down.
 fn key_down(vk: winapi::ctypes::c_int) -> bool {
@@ -101,7 +96,6 @@ pub struct App {
     project: RefCell<ProjectFile>,
     current_project_path: RefCell<Option<PathBuf>>,
     scan_thread: RefCell<Option<thread::JoinHandle<(scan::ScanResult, Option<db::ProjectDb>)>>>,
-    scan_log_lines: RefCell<Vec<String>>,
     db: RefCell<Option<db::ProjectDb>>,
     db_open_thread: RefCell<Option<thread::JoinHandle<Result<db::ProjectDb, db::DbError>>>>,
     /// The top-level directory right-clicked in `nav_tree`, remembered between
@@ -209,9 +203,6 @@ pub struct App {
     #[nwg_control(parent: nav_frame, flags: "VISIBLE")]
     #[nwg_events(OnTreeViewRightClick: [App::nav_tree_right_click])]
     nav_tree: nwg::TreeView,
-
-    #[nwg_control(parent: nav_frame, text: "", flags: "VISIBLE", readonly: true)]
-    scan_log: nwg::TextBox,
 
     #[nwg_control(parent: window, popup: true)]
     nav_tree_menu: nwg::Menu,
@@ -336,16 +327,12 @@ impl App {
             .build(&self.project_info_layout)
             .expect("Failed to build the Project Information column layout");
 
-        // Directory tree fills the space above the scan log, which stays pinned to the bottom.
+        // Directory tree fills the entire Left Navigation panel.
         nwg::FlexboxLayout::builder()
             .parent(&self.nav_frame)
-            .flex_direction(FlexDirection::Column)
             .padding(Rect { start: D::Points(8.0), end: D::Points(8.0), top: D::Points(8.0), bottom: D::Points(8.0) })
             .child(&self.nav_tree)
-            .child_size(Size { width: D::Percent(1.0), height: D::Auto })
-            .child_flex_grow(1.0)
-            .child(&self.scan_log)
-            .child_size(Size { width: D::Percent(1.0), height: D::Points(SCAN_LOG_HEIGHT) })
+            .child_size(Size { width: D::Percent(1.0), height: D::Percent(1.0) })
             .build(&self.nav_layout)
             .expect("Failed to build the Left Navigation layout");
     }
@@ -771,7 +758,7 @@ impl App {
         let Some(handle) = self.scan_thread.borrow_mut().take() else {
             return;
         };
-        let Ok((result, db)) = handle.join() else {
+        let Ok((_result, db)) = handle.join() else {
             return;
         };
 
@@ -783,12 +770,6 @@ impl App {
             *self.db.borrow_mut() = Some(db);
             self.refresh_nav_tree();
         }
-
-        let extensions = self.project.borrow().file_extensions.clone();
-        let lines = scan::format_summary(&result, &extensions);
-        let mut log = self.scan_log_lines.borrow_mut();
-        scan::append_capped(&mut log, lines, SCAN_LOG_MAX_LINES);
-        self.scan_log.set_text(&log.join("\r\n"));
     }
 }
 
@@ -797,8 +778,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_info_height_is_300_points() {
-        assert_eq!(PROJECT_INFO_HEIGHT, 300.0);
+    fn project_info_height_is_150_points() {
+        assert_eq!(PROJECT_INFO_HEIGHT, 150.0);
     }
 
     #[test]
