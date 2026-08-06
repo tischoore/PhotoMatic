@@ -40,16 +40,22 @@ const LIGHT_PANEL_COLOR: [u8; 3] = [245, 245, 245];
 /// a flex layout needs an explicit width *and* height — a `Dimension::Auto` on a control with
 /// no children and no measure function resolves to zero, not to its natural/content size.
 const SOURCE_DIR_ROW_HEIGHT: f32 = 24.0;
-const SOURCE_DIR_LABEL_WIDTH: f32 = 110.0;
 const SOURCE_DIR_INPUT_WIDTH: f32 = 500.0;
 const SOURCE_DIR_BROWSE_WIDTH: f32 = 90.0;
 
 /// Sizes for the File Types row's controls, directly below the Source Directory row.
 const FILE_TYPES_ROW_HEIGHT: f32 = 24.0;
-const FILE_TYPES_LABEL_WIDTH: f32 = 110.0;
+/// Shared width of the Source Directory and File Types label columns, so their
+/// controls line up in a grid. Wide enough to fit "Source Directory:" (the longer
+/// of the two label strings) without clipping.
+const PROJECT_INFO_LABEL_WIDTH: f32 = 130.0;
 const FILE_TYPE_CHECKBOX_WIDTH: f32 = 80.0;
 /// Vertical gap between the Source Directory and File Types rows.
 const PROJECT_INFO_ROW_GAP: f32 = 8.0;
+/// Height of `top_block_frame` (Source Directory + File Types). Same reasoning as the
+/// leaf-control note above — `top_block_frame` is itself a leaf as far as `project_info_layout`
+/// is concerned, so its `Dimension::Auto` would resolve to 0 rather than its content height.
+const TOP_BLOCK_HEIGHT: f32 = SOURCE_DIR_ROW_HEIGHT + PROJECT_INFO_ROW_GAP + FILE_TYPES_ROW_HEIGHT;
 
 /// Sizes for the Scan Directory area, pinned to the bottom-right of Project Information.
 const SCAN_BUTTON_WIDTH: f32 = 160.0;
@@ -57,6 +63,9 @@ const SCAN_BUTTON_HEIGHT: f32 = 30.0;
 const SCAN_PROGRESS_HEIGHT: f32 = 8.0;
 /// Vertical gap between the progress bar and the Scan Directory/Generate MetaData button.
 const SCAN_AREA_GAP: f32 = 6.0;
+/// Height of the Scan Directory/Generate MetaData column area. See `TOP_BLOCK_HEIGHT` for
+/// why this is computed explicitly rather than left to `Auto`.
+const SCAN_AREA_HEIGHT: f32 = SCAN_PROGRESS_HEIGHT + SCAN_AREA_GAP + SCAN_BUTTON_HEIGHT;
 /// Width of the Generate MetaData button, next to Scan Directory.
 const METADATA_BUTTON_WIDTH: f32 = SCAN_BUTTON_WIDTH;
 /// Horizontal gap between the Scan Directory and Generate MetaData columns.
@@ -180,42 +189,55 @@ pub struct App {
     #[nwg_control(parent: window, flags: "VISIBLE")]
     context_frame: nwg::Frame,
 
-    #[nwg_control(parent: project_info_frame, text: "Source Directory:")]
+    /// Holds the Source Directory and File Types rows, with its own independently-parented
+    /// layout below (`top_block_layout`) rather than being laid out directly inside
+    /// `project_info_frame`. This makes `justify_content: SpaceBetween` on `project_info_layout`
+    /// pin this block and `scan_area_frame` to the top and bottom edges of Project Information
+    /// by moving two real windows, rather than two `FlexboxLayout` nodes sharing that frame.
+    #[nwg_control(parent: project_info_frame, flags: "VISIBLE")]
+    top_block_frame: nwg::Frame,
+
+    /// Holds the Scan Directory/Generate MetaData columns. Same reasoning as
+    /// `top_block_frame` above.
+    #[nwg_control(parent: project_info_frame, flags: "VISIBLE")]
+    scan_area_frame: nwg::Frame,
+
+    #[nwg_control(parent: top_block_frame, text: "Source Directory:")]
     source_dir_label: nwg::Label,
 
-    #[nwg_control(parent: project_info_frame, text: "")]
+    #[nwg_control(parent: top_block_frame, text: "")]
     source_dir_input: nwg::TextInput,
 
-    #[nwg_control(parent: project_info_frame, text: "&Browse...")]
+    #[nwg_control(parent: top_block_frame, text: "&Browse...")]
     #[nwg_events(OnButtonClick: [App::browse_source_directory])]
     source_dir_browse: nwg::Button,
 
-    #[nwg_control(parent: project_info_frame, text: "File Types:")]
+    #[nwg_control(parent: top_block_frame, text: "File Types:")]
     file_types_label: nwg::Label,
 
-    #[nwg_control(parent: project_info_frame, text: "*.&jpg", check_state: nwg::CheckBoxState::Checked)]
+    #[nwg_control(parent: top_block_frame, text: "*.&jpg", check_state: nwg::CheckBoxState::Checked)]
     #[nwg_events(OnButtonClick: [App::sync_file_extensions_from_checkboxes])]
     file_type_jpg: nwg::CheckBox,
 
-    #[nwg_control(parent: project_info_frame, text: "*.C&R2", check_state: nwg::CheckBoxState::Checked)]
+    #[nwg_control(parent: top_block_frame, text: "*.C&R2", check_state: nwg::CheckBoxState::Checked)]
     #[nwg_events(OnButtonClick: [App::sync_file_extensions_from_checkboxes])]
     file_type_cr2: nwg::CheckBox,
 
-    #[nwg_control(parent: project_info_frame, text: "*.&gif", check_state: nwg::CheckBoxState::Unchecked)]
+    #[nwg_control(parent: top_block_frame, text: "*.&gif", check_state: nwg::CheckBoxState::Unchecked)]
     #[nwg_events(OnButtonClick: [App::sync_file_extensions_from_checkboxes])]
     file_type_gif: nwg::CheckBox,
 
-    #[nwg_control(parent: project_info_frame, flags: "MARQUEE", marquee: true, marquee_update: 30)]
+    #[nwg_control(parent: scan_area_frame, flags: "MARQUEE", marquee: true, marquee_update: 30)]
     scan_progress: nwg::ProgressBar,
 
-    #[nwg_control(parent: project_info_frame, text: "&Scan Directory")]
+    #[nwg_control(parent: scan_area_frame, text: "&Scan Directory")]
     #[nwg_events(OnButtonClick: [App::start_scan])]
     scan_button: nwg::Button,
 
-    #[nwg_control(parent: project_info_frame, flags: "MARQUEE", marquee: true, marquee_update: 30)]
+    #[nwg_control(parent: scan_area_frame, flags: "MARQUEE", marquee: true, marquee_update: 30)]
     metadata_progress: nwg::ProgressBar,
 
-    #[nwg_control(parent: project_info_frame, text: "&Generate MetaData")]
+    #[nwg_control(parent: scan_area_frame, text: "&Generate MetaData")]
     #[nwg_events(OnButtonClick: [App::start_generate_metadata])]
     metadata_button: nwg::Button,
 
@@ -233,6 +255,7 @@ pub struct App {
     body_layout: nwg::FlexboxLayout,
     root_layout: nwg::FlexboxLayout,
     project_info_layout: nwg::FlexboxLayout,
+    top_block_layout: nwg::FlexboxLayout,
     source_dir_layout: nwg::FlexboxLayout,
     file_types_layout: nwg::FlexboxLayout,
     scan_area_layout: nwg::FlexboxLayout,
@@ -247,17 +270,21 @@ impl App {
         *self.config.borrow_mut() = config;
         self.build_layout();
         panel_background::paint(&self.project_info_frame, DARK_PANEL_COLOR);
+        panel_background::paint(&self.top_block_frame, DARK_PANEL_COLOR);
+        panel_background::paint(&self.scan_area_frame, DARK_PANEL_COLOR);
         panel_background::paint(&self.nav_frame, DARK_PANEL_COLOR);
         panel_background::paint(&self.context_frame, LIGHT_PANEL_COLOR);
         self.refresh_metadata_button_enabled();
         self.window.set_visible(true);
     }
 
-    /// Builds the three-region layout (Project Information / Left Navigation / Context Window)
-    /// and the Source Directory control row inside Project Information. See `flexbox_sub_layout`
-    /// in the `native-windows-gui` examples for the nesting pattern this follows: a sub-layout
-    /// is attached with `child_layout` and targets the same parent as the layout that nests it —
-    /// nesting is a relationship between `FlexboxLayout`s, not between the windows they position.
+    /// Builds the three-region layout (Project Information / Left Navigation / Context Window).
+    /// Only the outermost `FlexboxLayout` for a given parent window may use `.build()` — it binds
+    /// its own `WM_SIZE` handler to that window, and `.build()`ing more than one layout against
+    /// the same parent stacks multiple independent, competing handlers on it, each repositioning
+    /// controls as if it alone owned the window. Anything meant to be nested into an outer layout
+    /// via `child_layout` (regardless of nesting depth) must use `.build_partial()` instead, which
+    /// registers no handler of its own and defers entirely to the outer layout that adopts it.
     fn build_layout(&self) {
         nwg::FlexboxLayout::builder()
             .parent(&self.window)
@@ -282,28 +309,28 @@ impl App {
 
         let row_margin = Rect { start: D::Points(0.0), end: D::Points(8.0), top: D::Points(0.0), bottom: D::Points(0.0) };
         nwg::FlexboxLayout::builder()
-            .parent(&self.project_info_frame)
+            .parent(&self.top_block_frame)
             .flex_direction(FlexDirection::Row)
             .justify_content(JustifyContent::FlexStart)
             .align_items(AlignItems::FlexStart)
             .child(&self.source_dir_label)
-            .child_size(Size { width: D::Points(SOURCE_DIR_LABEL_WIDTH), height: D::Points(SOURCE_DIR_ROW_HEIGHT) })
+            .child_size(Size { width: D::Points(PROJECT_INFO_LABEL_WIDTH), height: D::Points(SOURCE_DIR_ROW_HEIGHT) })
             .child_margin(row_margin)
             .child(&self.source_dir_input)
             .child_size(Size { width: D::Points(SOURCE_DIR_INPUT_WIDTH), height: D::Points(SOURCE_DIR_ROW_HEIGHT) })
             .child_margin(row_margin)
             .child(&self.source_dir_browse)
             .child_size(Size { width: D::Points(SOURCE_DIR_BROWSE_WIDTH), height: D::Points(SOURCE_DIR_ROW_HEIGHT) })
-            .build(&self.source_dir_layout)
+            .build_partial(&self.source_dir_layout)
             .expect("Failed to build the Source Directory row layout");
 
         nwg::FlexboxLayout::builder()
-            .parent(&self.project_info_frame)
+            .parent(&self.top_block_frame)
             .flex_direction(FlexDirection::Row)
             .justify_content(JustifyContent::FlexStart)
             .align_items(AlignItems::FlexStart)
             .child(&self.file_types_label)
-            .child_size(Size { width: D::Points(FILE_TYPES_LABEL_WIDTH), height: D::Points(FILE_TYPES_ROW_HEIGHT) })
+            .child_size(Size { width: D::Points(PROJECT_INFO_LABEL_WIDTH), height: D::Points(FILE_TYPES_ROW_HEIGHT) })
             .child_margin(row_margin)
             .child(&self.file_type_jpg)
             .child_size(Size { width: D::Points(FILE_TYPE_CHECKBOX_WIDTH), height: D::Points(FILE_TYPES_ROW_HEIGHT) })
@@ -313,14 +340,14 @@ impl App {
             .child_margin(row_margin)
             .child(&self.file_type_gif)
             .child_size(Size { width: D::Points(FILE_TYPE_CHECKBOX_WIDTH), height: D::Points(FILE_TYPES_ROW_HEIGHT) })
-            .build(&self.file_types_layout)
+            .build_partial(&self.file_types_layout)
             .expect("Failed to build the File Types row layout");
 
         // Progress bar above each button, both columns pinned to the bottom-right corner
         // of Project Information via `justify_content`/`align_items: FlexEnd`.
         let scan_area_margin = Rect { start: D::Points(0.0), end: D::Points(0.0), top: D::Points(0.0), bottom: D::Points(SCAN_AREA_GAP) };
         nwg::FlexboxLayout::builder()
-            .parent(&self.project_info_frame)
+            .parent(&self.scan_area_frame)
             .flex_direction(FlexDirection::Column)
             .justify_content(JustifyContent::FlexEnd)
             .align_items(AlignItems::FlexEnd)
@@ -333,7 +360,7 @@ impl App {
             .expect("Failed to build the Scan Directory column layout");
 
         nwg::FlexboxLayout::builder()
-            .parent(&self.project_info_frame)
+            .parent(&self.scan_area_frame)
             .flex_direction(FlexDirection::Column)
             .justify_content(JustifyContent::FlexEnd)
             .align_items(AlignItems::FlexEnd)
@@ -345,10 +372,14 @@ impl App {
             .build_partial(&self.metadata_column_layout)
             .expect("Failed to build the Generate MetaData column layout");
 
+        // Terminal layout for `scan_area_frame` — one `child_layout` level nesting
+        // `scan_column_layout`/`metadata_column_layout`, same depth as the proven
+        // `nav_layout` pattern, so it reliably fills and right/bottom-aligns within
+        // whatever size `scan_area_frame` is given below.
         let scan_area_column_margin =
             Rect { start: D::Points(0.0), end: D::Points(SCAN_AREA_COLUMN_GAP), top: D::Points(0.0), bottom: D::Points(0.0) };
         nwg::FlexboxLayout::builder()
-            .parent(&self.project_info_frame)
+            .parent(&self.scan_area_frame)
             .flex_direction(FlexDirection::Row)
             .justify_content(JustifyContent::FlexEnd)
             .align_items(AlignItems::FlexEnd)
@@ -357,23 +388,35 @@ impl App {
             .child_margin(scan_area_column_margin)
             .child_layout(&self.metadata_column_layout)
             .child_size(Size { width: D::Points(METADATA_BUTTON_WIDTH), height: D::Auto })
-            .build_partial(&self.scan_area_layout)
+            .build(&self.scan_area_layout)
             .expect("Failed to build the Scan Directory area layout");
 
+        // Terminal layout for `top_block_frame` — Source Directory and File Types
+        // stay tight together as one block.
         let rows_margin = Rect { start: D::Points(0.0), end: D::Points(0.0), top: D::Points(0.0), bottom: D::Points(PROJECT_INFO_ROW_GAP) };
         nwg::FlexboxLayout::builder()
-            .parent(&self.project_info_frame)
+            .parent(&self.top_block_frame)
             .flex_direction(FlexDirection::Column)
-            .padding(Rect { start: D::Points(12.0), end: D::Points(12.0), top: D::Points(12.0), bottom: D::Points(12.0) })
             .child_layout(&self.source_dir_layout)
             .child_size(Size { width: D::Auto, height: D::Points(SOURCE_DIR_ROW_HEIGHT) })
             .child_margin(rows_margin)
             .child_layout(&self.file_types_layout)
             .child_size(Size { width: D::Auto, height: D::Points(FILE_TYPES_ROW_HEIGHT) })
-            .child_margin(rows_margin)
-            .child_layout(&self.scan_area_layout)
-            .child_size(Size { width: D::Auto, height: D::Auto })
-            .child_flex_grow(1.0)
+            .build(&self.top_block_layout)
+            .expect("Failed to build the Project Information top block layout");
+
+        // `top_block_frame` and `scan_area_frame` are real windows (not nested `FlexboxLayout`s),
+        // so `justify_content: SpaceBetween` reliably pins the first to the top and the second to
+        // the bottom-right of Project Information.
+        nwg::FlexboxLayout::builder()
+            .parent(&self.project_info_frame)
+            .flex_direction(FlexDirection::Column)
+            .justify_content(JustifyContent::SpaceBetween)
+            .padding(Rect { start: D::Points(12.0), end: D::Points(12.0), top: D::Points(12.0), bottom: D::Points(12.0) })
+            .child(&self.top_block_frame)
+            .child_size(Size { width: D::Percent(1.0), height: D::Points(TOP_BLOCK_HEIGHT) })
+            .child(&self.scan_area_frame)
+            .child_size(Size { width: D::Percent(1.0), height: D::Points(SCAN_AREA_HEIGHT) })
             .build(&self.project_info_layout)
             .expect("Failed to build the Project Information column layout");
 
