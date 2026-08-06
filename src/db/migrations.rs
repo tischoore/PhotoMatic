@@ -8,7 +8,8 @@ fn migrations() -> &'static Migrations<'static> {
         Migrations::new(vec![
             M::up(include_str!("migrations/0001_initial.sql")),
             M::up(include_str!("migrations/0002_add_image_toplevel_dir.sql")),
-            // M::up(include_str!("migrations/0003_....sql")),  <- next migration goes here
+            M::up(include_str!("migrations/0003_add_image_exif_metadata.sql")),
+            // M::up(include_str!("migrations/0004_....sql")),  <- next migration goes here
         ])
     })
 }

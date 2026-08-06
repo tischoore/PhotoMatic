@@ -1,5 +1,7 @@
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use native_windows_derive::NwgUi;
@@ -8,6 +10,7 @@ use nwg::stretch::geometry::{Rect, Size};
 use nwg::stretch::style::{AlignItems, Dimension as D, FlexDirection, JustifyContent};
 
 use crate::db;
+use crate::exif;
 use crate::explorer;
 use crate::nav_tree;
 use crate::panel_background;
@@ -52,8 +55,12 @@ const PROJECT_INFO_ROW_GAP: f32 = 8.0;
 const SCAN_BUTTON_WIDTH: f32 = 160.0;
 const SCAN_BUTTON_HEIGHT: f32 = 30.0;
 const SCAN_PROGRESS_HEIGHT: f32 = 8.0;
-/// Vertical gap between the progress bar and the Scan Directory button.
+/// Vertical gap between the progress bar and the Scan Directory/Generate MetaData button.
 const SCAN_AREA_GAP: f32 = 6.0;
+/// Width of the Generate MetaData button, next to Scan Directory.
+const METADATA_BUTTON_WIDTH: f32 = SCAN_BUTTON_WIDTH;
+/// Horizontal gap between the Scan Directory and Generate MetaData columns.
+const SCAN_AREA_COLUMN_GAP: f32 = 12.0;
 
 /// Whether the given virtual key (e.g. `VK_CONTROL`) is currently held down.
 fn key_down(vk: winapi::ctypes::c_int) -> bool {
@@ -96,6 +103,7 @@ pub struct App {
     project: RefCell<ProjectFile>,
     current_project_path: RefCell<Option<PathBuf>>,
     scan_thread: RefCell<Option<thread::JoinHandle<(scan::ScanResult, Option<db::ProjectDb>)>>>,
+    metadata_thread: RefCell<Option<thread::JoinHandle<Option<db::ProjectDb>>>>,
     db: RefCell<Option<db::ProjectDb>>,
     db_open_thread: RefCell<Option<thread::JoinHandle<Result<db::ProjectDb, db::DbError>>>>,
     /// The top-level directory right-clicked in `nav_tree`, remembered between
@@ -114,6 +122,10 @@ pub struct App {
     #[nwg_control]
     #[nwg_events(OnNotice: [App::scan_finished])]
     scan_notice: nwg::Notice,
+
+    #[nwg_control]
+    #[nwg_events(OnNotice: [App::generate_metadata_finished])]
+    metadata_notice: nwg::Notice,
 
     #[nwg_control]
     #[nwg_events(OnNotice: [App::db_open_finished])]
@@ -200,6 +212,13 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::start_scan])]
     scan_button: nwg::Button,
 
+    #[nwg_control(parent: project_info_frame, flags: "MARQUEE", marquee: true, marquee_update: 30)]
+    metadata_progress: nwg::ProgressBar,
+
+    #[nwg_control(parent: project_info_frame, text: "&Generate MetaData")]
+    #[nwg_events(OnButtonClick: [App::start_generate_metadata])]
+    metadata_button: nwg::Button,
+
     #[nwg_control(parent: nav_frame, flags: "VISIBLE")]
     #[nwg_events(OnTreeViewRightClick: [App::nav_tree_right_click])]
     nav_tree: nwg::TreeView,
@@ -217,6 +236,8 @@ pub struct App {
     source_dir_layout: nwg::FlexboxLayout,
     file_types_layout: nwg::FlexboxLayout,
     scan_area_layout: nwg::FlexboxLayout,
+    scan_column_layout: nwg::FlexboxLayout,
+    metadata_column_layout: nwg::FlexboxLayout,
     nav_layout: nwg::FlexboxLayout,
 }
 
@@ -228,6 +249,7 @@ impl App {
         panel_background::paint(&self.project_info_frame, DARK_PANEL_COLOR);
         panel_background::paint(&self.nav_frame, DARK_PANEL_COLOR);
         panel_background::paint(&self.context_frame, LIGHT_PANEL_COLOR);
+        self.refresh_metadata_button_enabled();
         self.window.set_visible(true);
     }
 
@@ -294,8 +316,8 @@ impl App {
             .build(&self.file_types_layout)
             .expect("Failed to build the File Types row layout");
 
-        // Progress bar above the Scan Directory button, both pinned to the bottom-right
-        // corner of Project Information via `justify_content`/`align_items: FlexEnd`.
+        // Progress bar above each button, both columns pinned to the bottom-right corner
+        // of Project Information via `justify_content`/`align_items: FlexEnd`.
         let scan_area_margin = Rect { start: D::Points(0.0), end: D::Points(0.0), top: D::Points(0.0), bottom: D::Points(SCAN_AREA_GAP) };
         nwg::FlexboxLayout::builder()
             .parent(&self.project_info_frame)
@@ -307,6 +329,34 @@ impl App {
             .child_margin(scan_area_margin)
             .child(&self.scan_button)
             .child_size(Size { width: D::Points(SCAN_BUTTON_WIDTH), height: D::Points(SCAN_BUTTON_HEIGHT) })
+            .build_partial(&self.scan_column_layout)
+            .expect("Failed to build the Scan Directory column layout");
+
+        nwg::FlexboxLayout::builder()
+            .parent(&self.project_info_frame)
+            .flex_direction(FlexDirection::Column)
+            .justify_content(JustifyContent::FlexEnd)
+            .align_items(AlignItems::FlexEnd)
+            .child(&self.metadata_progress)
+            .child_size(Size { width: D::Points(METADATA_BUTTON_WIDTH), height: D::Points(SCAN_PROGRESS_HEIGHT) })
+            .child_margin(scan_area_margin)
+            .child(&self.metadata_button)
+            .child_size(Size { width: D::Points(METADATA_BUTTON_WIDTH), height: D::Points(SCAN_BUTTON_HEIGHT) })
+            .build_partial(&self.metadata_column_layout)
+            .expect("Failed to build the Generate MetaData column layout");
+
+        let scan_area_column_margin =
+            Rect { start: D::Points(0.0), end: D::Points(SCAN_AREA_COLUMN_GAP), top: D::Points(0.0), bottom: D::Points(0.0) };
+        nwg::FlexboxLayout::builder()
+            .parent(&self.project_info_frame)
+            .flex_direction(FlexDirection::Row)
+            .justify_content(JustifyContent::FlexEnd)
+            .align_items(AlignItems::FlexEnd)
+            .child_layout(&self.scan_column_layout)
+            .child_size(Size { width: D::Points(SCAN_BUTTON_WIDTH), height: D::Auto })
+            .child_margin(scan_area_column_margin)
+            .child_layout(&self.metadata_column_layout)
+            .child_size(Size { width: D::Points(METADATA_BUTTON_WIDTH), height: D::Auto })
             .build_partial(&self.scan_area_layout)
             .expect("Failed to build the Scan Directory area layout");
 
@@ -364,6 +414,7 @@ impl App {
         self.source_dir_input.set_text("");
         self.set_file_type_checkboxes(&FileExtensions::default());
         self.nav_tree.clear();
+        self.refresh_metadata_button_enabled();
     }
 
     fn file_load(&self) {
@@ -442,6 +493,7 @@ impl App {
                 }
                 *self.db.borrow_mut() = Some(db);
                 self.refresh_nav_tree();
+                self.refresh_metadata_button_enabled();
             }
             Err(err) => {
                 nwg::simple_message("PhotoMatic", &format!("Failed to open project database: {err}"));
@@ -770,6 +822,107 @@ impl App {
             *self.db.borrow_mut() = Some(db);
             self.refresh_nav_tree();
         }
+        self.refresh_metadata_button_enabled();
+    }
+
+    /// Enables `metadata_button` only once a scan has populated the database —
+    /// `project_settings.last_scan` (stamped by `finish_scan` after every completed
+    /// scan) is used as the "has scan run" signal. Disabled (including while `db`
+    /// is `None`, e.g. before the project's first save) otherwise, since there's
+    /// nothing to iterate before a scan has run.
+    fn refresh_metadata_button_enabled(&self) {
+        let enabled = self
+            .db
+            .borrow()
+            .as_ref()
+            .and_then(|db| db.project_settings().ok())
+            .map(|settings| settings.last_scan.is_some())
+            .unwrap_or(false);
+        self.metadata_button.set_enabled(enabled);
+    }
+
+    /// Extracts EXIF metadata for every image that doesn't have it yet, on a small
+    /// pool of reader threads, while keeping all database access on this one
+    /// orchestrating thread. Disallows a second concurrent run, and won't run
+    /// alongside a scan — both need exclusive ownership of `self.db`, the same
+    /// reason `rusqlite::Connection` (`Send` but not `Sync`) is moved into a single
+    /// thread rather than shared, as `start_scan` already does.
+    fn start_generate_metadata(&self) {
+        if self.metadata_thread.borrow().is_some() || self.scan_thread.borrow().is_some() {
+            return;
+        }
+
+        let Some(db) = self.db.borrow_mut().take() else {
+            return;
+        };
+        let Some(source_dir) = self.project.borrow().source_directory.clone() else {
+            *self.db.borrow_mut() = Some(db);
+            return;
+        };
+
+        self.metadata_button.set_enabled(false);
+        self.metadata_progress.set_visible(true);
+
+        let sender = self.metadata_notice.sender();
+        let handle = thread::spawn(move || {
+            let db = db;
+            let Ok(pending) = db.list_images_pending_metadata() else {
+                sender.notice();
+                return Some(db);
+            };
+
+            // Shared work queue: reader threads pop the next record (brief lock, no
+            // I/O held under it), read its file, and send the result back; this one
+            // thread is the only one that ever touches `db`.
+            let queue = Arc::new(Mutex::new(VecDeque::from(pending)));
+            let (tx, rx) = mpsc::channel::<(String, exif::ImageMetadata)>();
+
+            let reader_count = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            let readers: Vec<_> = (0..reader_count)
+                .map(|_| {
+                    let queue = Arc::clone(&queue);
+                    let reader_tx = tx.clone();
+                    let source_dir = source_dir.clone();
+                    thread::spawn(move || loop {
+                        let record = queue.lock().unwrap().pop_front();
+                        let Some(record) = record else { break };
+                        let path = explorer::resolve_path(&source_dir, &record.path);
+                        let metadata = exif::read_metadata(&path);
+                        if reader_tx.send((record.key, metadata)).is_err() {
+                            break;
+                        }
+                    })
+                })
+                .collect();
+            drop(tx);
+
+            for (key, metadata) in rx {
+                let _ = db.update_image_metadata(&key, &metadata);
+            }
+
+            for reader in readers {
+                let _ = reader.join();
+            }
+
+            sender.notice();
+            Some(db)
+        });
+        *self.metadata_thread.borrow_mut() = Some(handle);
+    }
+
+    /// Fired via `OnNotice` once the Generate MetaData thread finishes.
+    fn generate_metadata_finished(&self) {
+        let Some(handle) = self.metadata_thread.borrow_mut().take() else {
+            return;
+        };
+        let Ok(db) = handle.join() else {
+            return;
+        };
+
+        self.metadata_progress.set_visible(false);
+        self.metadata_button.set_enabled(true);
+        *self.db.borrow_mut() = db;
+        self.refresh_metadata_button_enabled();
     }
 }
 

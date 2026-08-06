@@ -10,6 +10,7 @@ use std::path::Path;
 use chrono::{NaiveDate, Utc};
 use rusqlite::Connection;
 
+use crate::exif;
 use crate::scan;
 
 pub struct ProjectDb {
@@ -83,10 +84,9 @@ impl ProjectDb {
         project_settings::update_last_scan(&self.conn, Utc::now())
     }
 
-    // The five methods below have no GUI caller yet — this phase is backend/schema
+    // The methods below have no GUI caller yet — this phase is backend/schema
     // plumbing only (see add_db.md). They're built now so a later metadata-editing UI
     // phase only adds controls + wiring, not schema/DB code.
-    #[allow(dead_code)]
     pub fn project_settings(&self) -> Result<models::ProjectSettings, DbError> {
         project_settings::get(&self.conn)
     }
@@ -117,6 +117,18 @@ impl ProjectDb {
         images::list_images(&self.conn)
     }
 
+    /// Images that have never had EXIF metadata extraction attempted — the work
+    /// list Generate MetaData iterates.
+    pub fn list_images_pending_metadata(&self) -> Result<Vec<models::ImageRecord>, DbError> {
+        images::list_images_pending_metadata(&self.conn)
+    }
+
+    /// Writes extracted EXIF metadata for the image `key`, stamping `metadata_read_at`
+    /// so it drops out of `list_images_pending_metadata` regardless of outcome.
+    pub fn update_image_metadata(&self, key: &str, metadata: &exif::ImageMetadata) -> Result<(), DbError> {
+        images::update_metadata(&self.conn, key, metadata)
+    }
+
     /// Per-directory, per-extension image counts backing the Left Navigation tree.
     pub fn directory_type_counts(&self) -> Result<Vec<(Option<String>, String, i64)>, DbError> {
         images::count_by_directory_and_type(&self.conn)
@@ -141,6 +153,7 @@ fn to_image_records(files: &[scan::ScannedFile], toplevel_dir: Option<String>) -
                 path,
                 image_type: file.extension.clone(),
                 toplevel_dir: toplevel_dir.clone(),
+                ..Default::default()
             }
         })
         .collect()
@@ -190,7 +203,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
 
         std::fs::remove_file(&path).ok();
     }
@@ -301,6 +314,84 @@ mod tests {
         assert_eq!(counts.len(), 2);
         assert!(counts.contains(&(None, "jpg".to_string(), 1)));
         assert!(counts.contains(&(Some("sub".to_string()), "cr2".to_string(), 1)));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Mirrors `read_metadata`'s output for a fully-tagged JPEG.
+    fn sample_metadata() -> exif::ImageMetadata {
+        exif::ImageMetadata {
+            date_taken: chrono::NaiveDate::from_ymd_opt(2024, 6, 15)
+                .unwrap()
+                .and_hms_opt(12, 30, 45),
+            width: Some(800),
+            height: Some(600),
+            exposure_time_seconds: Some(1.0 / 500.0),
+            iso: Some(200),
+            focal_length_mm: Some(50.0),
+        }
+    }
+
+    #[test]
+    fn list_images_pending_metadata_excludes_images_already_processed() {
+        let path = temp_db_path("pending-metadata-selection");
+        std::fs::remove_file(&path).ok();
+        let mut db = ProjectDb::open(&path).unwrap();
+
+        apply_units(&mut db, &sample_units());
+        let key = images::image_key("a.jpg");
+        db.update_image_metadata(&key, &sample_metadata()).unwrap();
+
+        let pending = db.list_images_pending_metadata().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].path, "sub/b.cr2");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn update_image_metadata_round_trips_through_list_images() {
+        let path = temp_db_path("update-metadata-roundtrip");
+        std::fs::remove_file(&path).ok();
+        let mut db = ProjectDb::open(&path).unwrap();
+
+        apply_units(&mut db, &sample_units());
+        let key = images::image_key("a.jpg");
+        let metadata = sample_metadata();
+        db.update_image_metadata(&key, &metadata).unwrap();
+
+        let images = db.list_images().unwrap();
+        let image = images.iter().find(|i| i.path == "a.jpg").unwrap();
+        assert_eq!(image.date_taken, metadata.date_taken);
+        assert_eq!(image.width, metadata.width);
+        assert_eq!(image.height, metadata.height);
+        assert_eq!(image.exposure_time, metadata.exposure_time_seconds);
+        assert_eq!(image.iso, metadata.iso);
+        assert_eq!(image.focal_length, metadata.focal_length_mm);
+        assert!(image.metadata_read_at.is_some());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rescan_does_not_clobber_or_requeue_already_generated_metadata() {
+        let path = temp_db_path("rescan-preserves-metadata-generation");
+        std::fs::remove_file(&path).ok();
+        let mut db = ProjectDb::open(&path).unwrap();
+
+        apply_units(&mut db, &sample_units());
+        let key = images::image_key("a.jpg");
+        db.update_image_metadata(&key, &sample_metadata()).unwrap();
+
+        apply_units(&mut db, &sample_units());
+
+        let images = db.list_images().unwrap();
+        let image = images.iter().find(|i| i.path == "a.jpg").unwrap();
+        assert_eq!(image.width, Some(800));
+        assert!(image.metadata_read_at.is_some());
+
+        let pending = db.list_images_pending_metadata().unwrap();
+        assert!(!pending.iter().any(|i| i.path == "a.jpg"));
 
         std::fs::remove_file(&path).ok();
     }

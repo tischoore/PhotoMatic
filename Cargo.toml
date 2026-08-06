@@ -13,6 +13,7 @@ rusqlite = { version = "0.40.1", features = ["bundled", "chrono"] }
 rusqlite_migration = "2.6.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+kamadak-exif = "0.6"
 
 [build-dependencies]
 embed-manifest = "1"
