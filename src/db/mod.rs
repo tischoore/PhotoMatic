@@ -1,8 +1,11 @@
 mod directories;
+mod events;
 mod images;
 mod migrations;
 pub mod models;
 mod project_settings;
+
+pub use events::EventThresholds;
 
 use std::fmt;
 use std::path::Path;
@@ -143,6 +146,13 @@ impl ProjectDb {
     ) -> Result<Vec<models::ImageRecord>, DbError> {
         images::list_images_by_directory(&self.conn, toplevel_dir, image_type)
     }
+
+    /// Clears and rebuilds the `events`/`event_images` tables from `images`, clustered at
+    /// all three tiers (Tight Burst, Session, Multi-hour) per `thresholds` — backs the
+    /// "Generate Events" button.
+    pub fn regenerate_events(&mut self, images: &[models::ImageRecord], thresholds: &EventThresholds) -> Result<(), DbError> {
+        events::regenerate(&mut self.conn, images, thresholds)
+    }
 }
 
 /// Normalizes a relative path to forward-slash (POSIX) separators, regardless of the
@@ -213,7 +223,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
 
         std::fs::remove_file(&path).ok();
     }

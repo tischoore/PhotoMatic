@@ -29,6 +29,50 @@ pub struct ProjectFile {
     /// When the database was last written to (e.g. after a scan committed rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_last_modified: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// The Generate Events button's per-tier gap thresholds.
+    #[serde(default, skip_serializing_if = "EventThresholds::is_default")]
+    pub event_thresholds: EventThresholds,
+}
+
+/// The Generate Events button's per-tier gap thresholds: two photos in the same tier's
+/// group when the gap since the previous one, sorted by `date_taken`, is at most this value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventThresholds {
+    #[serde(default = "EventThresholds::default_burst_seconds")]
+    pub burst_gap_seconds: u32,
+    #[serde(default = "EventThresholds::default_session_minutes")]
+    pub session_gap_minutes: u32,
+    #[serde(default = "EventThresholds::default_multi_hour_hours")]
+    pub multi_hour_gap_hours: u32,
+}
+
+impl EventThresholds {
+    fn default_burst_seconds() -> u32 {
+        10
+    }
+
+    fn default_session_minutes() -> u32 {
+        60
+    }
+
+    fn default_multi_hour_hours() -> u32 {
+        8
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for EventThresholds {
+    fn default() -> Self {
+        EventThresholds {
+            burst_gap_seconds: Self::default_burst_seconds(),
+            session_gap_minutes: Self::default_session_minutes(),
+            multi_hour_gap_hours: Self::default_multi_hour_hours(),
+        }
+    }
 }
 
 /// Which file extensions to include from the Source Directory. Defaults to all included.
@@ -156,6 +200,29 @@ mod tests {
         let project = ProjectFile {
             source_directory: None,
             file_extensions: FileExtensions { jpg: true, cr2: false, gif: false },
+            ..ProjectFile::default()
+        };
+
+        save(&path, &project).unwrap();
+        let loaded = load(&path).unwrap();
+
+        assert_eq!(loaded, project);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn event_thresholds_default_to_10s_60min_8h() {
+        assert_eq!(
+            EventThresholds::default(),
+            EventThresholds { burst_gap_seconds: 10, session_gap_minutes: 60, multi_hour_gap_hours: 8 }
+        );
+    }
+
+    #[test]
+    fn round_trips_event_thresholds_through_json() {
+        let path = temp_path("project-event-thresholds.json");
+        let project = ProjectFile {
+            event_thresholds: EventThresholds { burst_gap_seconds: 5, session_gap_minutes: 30, multi_hour_gap_hours: 6 },
             ..ProjectFile::default()
         };
 

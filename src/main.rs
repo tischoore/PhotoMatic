@@ -4,6 +4,7 @@ mod about_modal;
 mod app;
 mod context_tabs;
 mod db;
+mod events;
 mod exif;
 mod explorer;
 mod nav_tree;

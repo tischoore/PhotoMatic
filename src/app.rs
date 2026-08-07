@@ -16,7 +16,7 @@ use crate::exif;
 use crate::explorer;
 use crate::nav_tree;
 use crate::panel_background;
-use crate::project::{self, FileExtensions, ProjectFile};
+use crate::project::{self, EventThresholds, FileExtensions, ProjectFile};
 use crate::scan;
 use crate::settings::{self, AppConfig};
 use crate::settings_modal;
@@ -26,7 +26,7 @@ use crate::window_mode;
 const PROJECT_FILTER: &str = "PhotoMatic Project(*.json)";
 
 /// Height of the Project Information strip, in points (`FlexboxLayout` units).
-const PROJECT_INFO_HEIGHT: f32 = 150.0;
+const PROJECT_INFO_HEIGHT: f32 = 182.0;
 /// Width of the Left Navigation panel, as a fraction of the space below Project Information.
 const NAV_WIDTH_PERCENT: f32 = 0.2;
 /// Width of the Context Window, as a fraction of the space below Project Information.
@@ -57,7 +57,14 @@ const PROJECT_INFO_ROW_GAP: f32 = 8.0;
 /// Height of `top_block_frame` (Source Directory + File Types). Same reasoning as the
 /// leaf-control note above — `top_block_frame` is itself a leaf as far as `project_info_layout`
 /// is concerned, so its `Dimension::Auto` would resolve to 0 rather than its content height.
-const TOP_BLOCK_HEIGHT: f32 = SOURCE_DIR_ROW_HEIGHT + PROJECT_INFO_ROW_GAP + FILE_TYPES_ROW_HEIGHT;
+/// Height of the Event Gaps row, directly below File Types.
+const EVENT_THRESHOLDS_ROW_HEIGHT: f32 = 24.0;
+/// Width of each Event Gaps numeric input (Burst/Session/Multi-hour).
+const EVENT_THRESHOLD_INPUT_WIDTH: f32 = 45.0;
+/// Width of each Event Gaps unit label ("sec"/"min"/"hr") following its input.
+const EVENT_THRESHOLD_UNIT_LABEL_WIDTH: f32 = 34.0;
+const TOP_BLOCK_HEIGHT: f32 =
+    SOURCE_DIR_ROW_HEIGHT + PROJECT_INFO_ROW_GAP + FILE_TYPES_ROW_HEIGHT + PROJECT_INFO_ROW_GAP + EVENT_THRESHOLDS_ROW_HEIGHT;
 
 /// Sizes for the Scan Directory area, pinned to the bottom-right of Project Information.
 const SCAN_BUTTON_WIDTH: f32 = 160.0;
@@ -70,7 +77,11 @@ const SCAN_AREA_GAP: f32 = 6.0;
 const SCAN_AREA_HEIGHT: f32 = SCAN_PROGRESS_HEIGHT + SCAN_AREA_GAP + SCAN_BUTTON_HEIGHT;
 /// Width of the Generate MetaData button, next to Scan Directory.
 const METADATA_BUTTON_WIDTH: f32 = SCAN_BUTTON_WIDTH;
-/// Horizontal gap between the Scan Directory and Generate MetaData columns.
+/// Width of the Generate Events button, next to Generate MetaData. Has no progress bar of
+/// its own (it runs synchronously — see `start_generate_events`), so it bottom-aligns with
+/// the other two columns via `scan_area_layout`'s `align_items: FlexEnd`.
+const EVENTS_BUTTON_WIDTH: f32 = SCAN_BUTTON_WIDTH;
+/// Horizontal gap between the Scan Directory, Generate MetaData, and Generate Events columns.
 const SCAN_AREA_COLUMN_GAP: f32 = 12.0;
 
 /// Whether the given virtual key (e.g. `VK_CONTROL`) is currently held down.
@@ -304,6 +315,27 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::sync_file_extensions_from_checkboxes])]
     file_type_gif: nwg::CheckBox,
 
+    #[nwg_control(parent: top_block_frame, text: "Event Gaps:")]
+    event_thresholds_label: nwg::Label,
+
+    #[nwg_control(parent: top_block_frame, text: "10")]
+    burst_gap_input: nwg::TextInput,
+
+    #[nwg_control(parent: top_block_frame, text: "sec")]
+    burst_gap_unit_label: nwg::Label,
+
+    #[nwg_control(parent: top_block_frame, text: "60")]
+    session_gap_input: nwg::TextInput,
+
+    #[nwg_control(parent: top_block_frame, text: "min")]
+    session_gap_unit_label: nwg::Label,
+
+    #[nwg_control(parent: top_block_frame, text: "8")]
+    multi_hour_gap_input: nwg::TextInput,
+
+    #[nwg_control(parent: top_block_frame, text: "hr")]
+    multi_hour_gap_unit_label: nwg::Label,
+
     #[nwg_control(parent: scan_area_frame, flags: "MARQUEE", marquee: true, marquee_update: 30)]
     scan_progress: nwg::ProgressBar,
 
@@ -317,6 +349,10 @@ pub struct App {
     #[nwg_control(parent: scan_area_frame, text: "&Generate MetaData")]
     #[nwg_events(OnButtonClick: [App::start_generate_metadata])]
     metadata_button: nwg::Button,
+
+    #[nwg_control(parent: scan_area_frame, text: "Generate &Events")]
+    #[nwg_events(OnButtonClick: [App::start_generate_events])]
+    events_button: nwg::Button,
 
     #[nwg_control(parent: nav_frame, flags: "VISIBLE")]
     #[nwg_events(OnTreeViewRightClick: [App::nav_tree_right_click])]
@@ -353,9 +389,11 @@ pub struct App {
     top_block_layout: nwg::FlexboxLayout,
     source_dir_layout: nwg::FlexboxLayout,
     file_types_layout: nwg::FlexboxLayout,
+    event_thresholds_layout: nwg::FlexboxLayout,
     scan_area_layout: nwg::FlexboxLayout,
     scan_column_layout: nwg::FlexboxLayout,
     metadata_column_layout: nwg::FlexboxLayout,
+    events_column_layout: nwg::FlexboxLayout,
     nav_layout: nwg::FlexboxLayout,
     context_layout: nwg::FlexboxLayout,
 }
@@ -371,6 +409,7 @@ impl App {
         panel_background::paint(&self.nav_frame, DARK_PANEL_COLOR);
         panel_background::paint(&self.context_frame, LIGHT_PANEL_COLOR);
         self.refresh_metadata_button_enabled();
+        self.refresh_events_button_enabled();
         self.window.set_visible(true);
     }
 
@@ -439,6 +478,31 @@ impl App {
             .build_partial(&self.file_types_layout)
             .expect("Failed to build the File Types row layout");
 
+        nwg::FlexboxLayout::builder()
+            .parent(&self.top_block_frame)
+            .flex_direction(FlexDirection::Row)
+            .justify_content(JustifyContent::FlexStart)
+            .align_items(AlignItems::FlexStart)
+            .child(&self.event_thresholds_label)
+            .child_size(Size { width: D::Points(PROJECT_INFO_LABEL_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .child_margin(row_margin)
+            .child(&self.burst_gap_input)
+            .child_size(Size { width: D::Points(EVENT_THRESHOLD_INPUT_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .child(&self.burst_gap_unit_label)
+            .child_size(Size { width: D::Points(EVENT_THRESHOLD_UNIT_LABEL_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .child_margin(row_margin)
+            .child(&self.session_gap_input)
+            .child_size(Size { width: D::Points(EVENT_THRESHOLD_INPUT_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .child(&self.session_gap_unit_label)
+            .child_size(Size { width: D::Points(EVENT_THRESHOLD_UNIT_LABEL_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .child_margin(row_margin)
+            .child(&self.multi_hour_gap_input)
+            .child_size(Size { width: D::Points(EVENT_THRESHOLD_INPUT_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .child(&self.multi_hour_gap_unit_label)
+            .child_size(Size { width: D::Points(EVENT_THRESHOLD_UNIT_LABEL_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .build_partial(&self.event_thresholds_layout)
+            .expect("Failed to build the Event Gaps row layout");
+
         // Progress bar above each button, both columns pinned to the bottom-right corner
         // of Project Information via `justify_content`/`align_items: FlexEnd`.
         let scan_area_margin = Rect { start: D::Points(0.0), end: D::Points(0.0), top: D::Points(0.0), bottom: D::Points(SCAN_AREA_GAP) };
@@ -468,10 +532,22 @@ impl App {
             .build_partial(&self.metadata_column_layout)
             .expect("Failed to build the Generate MetaData column layout");
 
+        // No progress bar of its own (runs synchronously) — bottom-aligns with the other
+        // two columns via `scan_area_layout`'s `align_items: FlexEnd` below.
+        nwg::FlexboxLayout::builder()
+            .parent(&self.scan_area_frame)
+            .flex_direction(FlexDirection::Column)
+            .justify_content(JustifyContent::FlexEnd)
+            .align_items(AlignItems::FlexEnd)
+            .child(&self.events_button)
+            .child_size(Size { width: D::Points(EVENTS_BUTTON_WIDTH), height: D::Points(SCAN_BUTTON_HEIGHT) })
+            .build_partial(&self.events_column_layout)
+            .expect("Failed to build the Generate Events column layout");
+
         // Terminal layout for `scan_area_frame` — one `child_layout` level nesting
-        // `scan_column_layout`/`metadata_column_layout`, same depth as the proven
-        // `nav_layout` pattern, so it reliably fills and right/bottom-aligns within
-        // whatever size `scan_area_frame` is given below.
+        // `scan_column_layout`/`metadata_column_layout`/`events_column_layout`, same depth
+        // as the proven `nav_layout` pattern, so it reliably fills and right/bottom-aligns
+        // within whatever size `scan_area_frame` is given below.
         let scan_area_column_margin =
             Rect { start: D::Points(0.0), end: D::Points(SCAN_AREA_COLUMN_GAP), top: D::Points(0.0), bottom: D::Points(0.0) };
         nwg::FlexboxLayout::builder()
@@ -484,6 +560,9 @@ impl App {
             .child_margin(scan_area_column_margin)
             .child_layout(&self.metadata_column_layout)
             .child_size(Size { width: D::Points(METADATA_BUTTON_WIDTH), height: D::Auto })
+            .child_margin(scan_area_column_margin)
+            .child_layout(&self.events_column_layout)
+            .child_size(Size { width: D::Points(EVENTS_BUTTON_WIDTH), height: D::Auto })
             .build(&self.scan_area_layout)
             .expect("Failed to build the Scan Directory area layout");
 
@@ -498,6 +577,9 @@ impl App {
             .child_margin(rows_margin)
             .child_layout(&self.file_types_layout)
             .child_size(Size { width: D::Auto, height: D::Points(FILE_TYPES_ROW_HEIGHT) })
+            .child_margin(rows_margin)
+            .child_layout(&self.event_thresholds_layout)
+            .child_size(Size { width: D::Auto, height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
             .build(&self.top_block_layout)
             .expect("Failed to build the Project Information top block layout");
 
@@ -562,8 +644,10 @@ impl App {
         *self.db.borrow_mut() = None;
         self.source_dir_input.set_text("");
         self.set_file_type_checkboxes(&FileExtensions::default());
+        self.set_event_threshold_inputs(&EventThresholds::default());
         self.nav_tree.clear();
         self.refresh_metadata_button_enabled();
+        self.refresh_events_button_enabled();
     }
 
     fn file_load(&self) {
@@ -585,6 +669,7 @@ impl App {
                 let source_dir = loaded.source_directory.clone();
                 let database_path = loaded.database_path.clone();
                 self.set_file_type_checkboxes(&loaded.file_extensions);
+                self.set_event_threshold_inputs(&loaded.event_thresholds);
                 *self.project.borrow_mut() = loaded;
                 *self.current_project_path.borrow_mut() = Some(path.clone());
                 self.source_dir_input.set_text(
@@ -643,6 +728,7 @@ impl App {
                 *self.db.borrow_mut() = Some(db);
                 self.refresh_nav_tree();
                 self.refresh_metadata_button_enabled();
+                self.refresh_events_button_enabled();
             }
             Err(err) => {
                 nwg::simple_message("PhotoMatic", &format!("Failed to open project database: {err}"));
@@ -1060,6 +1146,32 @@ impl App {
         self.file_type_gif.set_check_state(state(extensions.gif));
     }
 
+    /// Writes the Event Gaps inputs' current values into `self.project`, read at the point
+    /// Generate Events runs (the same pull-based pattern `sync_source_directory_from_input`
+    /// uses at `start_scan`, rather than syncing on every keystroke). A box that doesn't
+    /// parse as a whole number simply leaves the previously-synced value in place.
+    fn sync_event_thresholds_from_inputs(&self) {
+        let mut thresholds = self.project.borrow().event_thresholds.clone();
+        if let Ok(value) = self.burst_gap_input.text().trim().parse() {
+            thresholds.burst_gap_seconds = value;
+        }
+        if let Ok(value) = self.session_gap_input.text().trim().parse() {
+            thresholds.session_gap_minutes = value;
+        }
+        if let Ok(value) = self.multi_hour_gap_input.text().trim().parse() {
+            thresholds.multi_hour_gap_hours = value;
+        }
+        self.project.borrow_mut().event_thresholds = thresholds;
+    }
+
+    /// Sets the Event Gaps inputs to reflect `thresholds` — used when starting a new project
+    /// or loading one, the reverse direction of `sync_event_thresholds_from_inputs`.
+    fn set_event_threshold_inputs(&self, thresholds: &EventThresholds) {
+        self.burst_gap_input.set_text(&thresholds.burst_gap_seconds.to_string());
+        self.session_gap_input.set_text(&thresholds.session_gap_minutes.to_string());
+        self.multi_hour_gap_input.set_text(&thresholds.multi_hour_gap_hours.to_string());
+    }
+
     /// Directory of the most recently loaded/saved project, if that directory
     /// still exists — used to default the Load and Save As dialogs.
     fn recent_dir(&self) -> Option<PathBuf> {
@@ -1175,6 +1287,7 @@ impl App {
             self.refresh_nav_tree();
         }
         self.refresh_metadata_button_enabled();
+        self.refresh_events_button_enabled();
     }
 
     /// Enables `metadata_button` only once a scan has populated the database —
@@ -1191,6 +1304,46 @@ impl App {
             .map(|settings| settings.last_scan.is_some())
             .unwrap_or(false);
         self.metadata_button.set_enabled(enabled);
+    }
+
+    /// Enables `events_button` under the same "has a scan run" condition as
+    /// `refresh_metadata_button_enabled`, rather than requiring Generate MetaData to have
+    /// completed first — clicking before any `date_taken` values exist just produces zero
+    /// events (see `start_generate_events`), which is harmless.
+    fn refresh_events_button_enabled(&self) {
+        let enabled = self
+            .db
+            .borrow()
+            .as_ref()
+            .and_then(|db| db.project_settings().ok())
+            .map(|settings| settings.last_scan.is_some())
+            .unwrap_or(false);
+        self.events_button.set_enabled(enabled);
+    }
+
+    /// Clusters every image in the project by `date_taken` at all three tiers (Tight Burst,
+    /// Session, Multi-hour) and writes the result into the `events`/`event_images` tables,
+    /// replacing whatever was there from a previous run. Runs synchronously on the UI thread
+    /// (unlike Generate MetaData): it only reads already-cached `date_taken` values and
+    /// writes locally to SQLite, no per-file disk/EXIF reads, so it doesn't need a
+    /// background thread.
+    fn start_generate_events(&self) {
+        self.sync_event_thresholds_from_inputs();
+
+        let mut db = self.db.borrow_mut();
+        let Some(db) = db.as_mut() else { return };
+
+        let images = db.list_images().unwrap_or_default();
+        let thresholds = self.project.borrow().event_thresholds.clone();
+        let db_thresholds = db::EventThresholds {
+            burst: chrono::Duration::seconds(thresholds.burst_gap_seconds as i64),
+            session: chrono::Duration::minutes(thresholds.session_gap_minutes as i64),
+            multi_hour: chrono::Duration::hours(thresholds.multi_hour_gap_hours as i64),
+        };
+
+        if let Err(err) = db.regenerate_events(&images, &db_thresholds) {
+            nwg::simple_message("PhotoMatic", &format!("Failed to generate events: {err}"));
+        }
     }
 
     /// Extracts EXIF metadata for every image that doesn't have it yet, on a small
@@ -1275,6 +1428,7 @@ impl App {
         self.metadata_button.set_enabled(true);
         *self.db.borrow_mut() = db;
         self.refresh_metadata_button_enabled();
+        self.refresh_events_button_enabled();
     }
 }
 
@@ -1283,8 +1437,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_info_height_is_150_points() {
-        assert_eq!(PROJECT_INFO_HEIGHT, 150.0);
+    fn project_info_height_is_182_points() {
+        assert_eq!(PROJECT_INFO_HEIGHT, 182.0);
     }
 
     #[test]

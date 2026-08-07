@@ -15,6 +15,9 @@ Every menu item, and every other actionable GUI control, must have a keyboard sh
 
 Implementation note for this codebase (native-windows-gui): there is no accelerator-table API, so `\t`-suffixed shortcut text is cosmetic only — real Ctrl-key handling must be done by hand via the window's `OnKeyPress` event. Keep the key-combination-to-action mapping in a pure function (see `src/shortcuts.rs`) so it can be unit-tested independently of NWG, per the testing rule below, and have the event handler do nothing but read modifier state and call that function.
 
+## UI alignment
+When implementing UI ensure that the result always align and follows normal Windows application standards.
+
 ## Testing
 
 Every feature must be implemented alongside a test that verifies it independently of the others. Before considering a feature done:
