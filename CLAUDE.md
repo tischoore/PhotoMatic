@@ -2,6 +2,9 @@
 
 Instructions for Claude Code (and any other contributor, human or AI) working in this repository.
 
+## File format
+Replace LF with CRLF
+
 ## Documentation
 
 Every feature must be documented in `README.md`. When you add, change, or remove a user-facing feature, update the README's Features section (and any other affected section, such as Project layout) in the same change — do not leave it to a follow-up.

@@ -41,12 +41,12 @@ const LIGHT_PANEL_COLOR: [u8; 3] = [245, 245, 245];
 /// is built on) has no way to measure a Win32 control's natural size, so every leaf control in
 /// a flex layout needs an explicit width *and* height — a `Dimension::Auto` on a control with
 /// no children and no measure function resolves to zero, not to its natural/content size.
-const SOURCE_DIR_ROW_HEIGHT: f32 = 24.0;
+const SOURCE_DIR_ROW_HEIGHT: f32 = 28.0;
 const SOURCE_DIR_INPUT_WIDTH: f32 = 500.0;
 const SOURCE_DIR_BROWSE_WIDTH: f32 = 90.0;
 
 /// Sizes for the File Types row's controls, directly below the Source Directory row.
-const FILE_TYPES_ROW_HEIGHT: f32 = 24.0;
+const FILE_TYPES_ROW_HEIGHT: f32 = 28.0;
 /// Shared width of the Source Directory and File Types label columns, so their
 /// controls line up in a grid. Wide enough to fit "Source Directory:" (the longer
 /// of the two label strings) without clipping.
@@ -58,7 +58,7 @@ const PROJECT_INFO_ROW_GAP: f32 = 8.0;
 /// leaf-control note above — `top_block_frame` is itself a leaf as far as `project_info_layout`
 /// is concerned, so its `Dimension::Auto` would resolve to 0 rather than its content height.
 /// Height of the Event Gaps row, directly below File Types.
-const EVENT_THRESHOLDS_ROW_HEIGHT: f32 = 24.0;
+const EVENT_THRESHOLDS_ROW_HEIGHT: f32 = 28.0;
 /// Width of each Event Gaps numeric input (Burst/Session/Multi-hour).
 const EVENT_THRESHOLD_INPUT_WIDTH: f32 = 45.0;
 /// Width of each Event Gaps unit label ("sec"/"min"/"hr") following its input.
@@ -421,23 +421,37 @@ impl App {
     /// via `child_layout` (regardless of nesting depth) must use `.build_partial()` instead, which
     /// registers no handler of its own and defers entirely to the outer layout that adopts it.
     fn build_layout(&self) {
+        // `FlexboxLayout::builder()` defaults to a 5pt `auto_spacing` (padding on the
+        // container plus margin on every child) unless `.padding`/`.child_margin` is called
+        // explicitly, which cancels it. Every other layout below sets its spacing explicitly;
+        // `body_layout` and `root_layout` must too, via this zero rect, so Project Information
+        // sits flush against the Left Navigation/Context Window edges rather than picking up
+        // the library's default gap.
+        let no_spacing = Rect { start: D::Points(0.0), end: D::Points(0.0), top: D::Points(0.0), bottom: D::Points(0.0) };
+
         nwg::FlexboxLayout::builder()
             .parent(&self.window)
             .flex_direction(FlexDirection::Row)
+            .padding(no_spacing)
             .child(&self.nav_frame)
             .child_size(Size { width: D::Percent(NAV_WIDTH_PERCENT), height: D::Auto })
+            .child_margin(no_spacing)
             .child(&self.context_frame)
             .child_size(Size { width: D::Percent(CONTEXT_WIDTH_PERCENT), height: D::Auto })
+            .child_margin(no_spacing)
             .build_partial(&self.body_layout)
             .expect("Failed to build the nav/context layout");
 
         nwg::FlexboxLayout::builder()
             .parent(&self.window)
             .flex_direction(FlexDirection::Column)
+            .padding(no_spacing)
             .child(&self.project_info_frame)
             .child_size(Size { width: D::Auto, height: D::Points(PROJECT_INFO_HEIGHT) })
+            .child_margin(no_spacing)
             .child_layout(&self.body_layout)
             .child_size(Size { width: D::Auto, height: D::Auto })
+            .child_margin(no_spacing)
             .child_flex_grow(1.0)
             .build(&self.root_layout)
             .expect("Failed to build the root layout");
@@ -533,7 +547,12 @@ impl App {
             .expect("Failed to build the Generate MetaData column layout");
 
         // No progress bar of its own (runs synchronously) — bottom-aligns with the other
-        // two columns via `scan_area_layout`'s `align_items: FlexEnd` below.
+        // two columns via `scan_area_layout`'s `align_items: FlexEnd` below. The explicit
+        // `child_margin(no_spacing)` is required even though it's a no-op margin: without any
+        // `.padding`/`.child_margin` call in this chain, `FlexboxLayoutBuilder`'s default 5pt
+        // `auto_spacing` stays active and silently insets `events_button`, breaking alignment
+        // with `scan_button`/`metadata_button` (whose columns cancel it via the margin call
+        // between their progress bar and button).
         nwg::FlexboxLayout::builder()
             .parent(&self.scan_area_frame)
             .flex_direction(FlexDirection::Column)
@@ -541,6 +560,7 @@ impl App {
             .align_items(AlignItems::FlexEnd)
             .child(&self.events_button)
             .child_size(Size { width: D::Points(EVENTS_BUTTON_WIDTH), height: D::Points(SCAN_BUTTON_HEIGHT) })
+            .child_margin(no_spacing)
             .build_partial(&self.events_column_layout)
             .expect("Failed to build the Generate Events column layout");
 
