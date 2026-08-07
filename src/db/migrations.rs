@@ -11,7 +11,8 @@ fn migrations() -> &'static Migrations<'static> {
             M::up(include_str!("migrations/0003_add_image_exif_metadata.sql")),
             M::up(include_str!("migrations/0004_add_events.sql")),
             M::up(include_str!("migrations/0005_add_image_gps.sql")),
-            // M::up(include_str!("migrations/0006_....sql")),  <- next migration goes here
+            M::up(include_str!("migrations/0006_reset_metadata_read_at_for_gps_backfill.sql")),
+            // M::up(include_str!("migrations/0007_....sql")),  <- next migration goes here
         ])
     })
 }

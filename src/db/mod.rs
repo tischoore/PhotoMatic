@@ -223,7 +223,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
 
         std::fs::remove_file(&path).ok();
     }
@@ -470,6 +470,30 @@ mod tests {
 
         let pending = db.list_images_pending_metadata().unwrap();
         assert!(!pending.iter().any(|i| i.path == "a.jpg"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn metadata_reset_migration_requeues_already_processed_images_for_gps_backfill() {
+        let path = temp_db_path("metadata-reset-migration-requeue");
+        std::fs::remove_file(&path).ok();
+        let mut db = ProjectDb::open(&path).unwrap();
+
+        apply_units(&mut db, &sample_units());
+        let key = images::image_key("a.jpg");
+        db.update_image_metadata(&key, &sample_metadata()).unwrap();
+        assert!(!db.list_images_pending_metadata().unwrap().iter().any(|i| i.path == "a.jpg"));
+
+        // Simulates upgrading an already-migrated database: reapplying migration 0006's
+        // effect must requeue every previously-processed image, so Generate MetaData can
+        // pick up GPS for images that were scanned before GPS extraction existed.
+        db.conn
+            .execute_batch(include_str!("migrations/0006_reset_metadata_read_at_for_gps_backfill.sql"))
+            .unwrap();
+
+        let pending = db.list_images_pending_metadata().unwrap();
+        assert!(pending.iter().any(|i| i.path == "a.jpg"));
 
         std::fs::remove_file(&path).ok();
     }
