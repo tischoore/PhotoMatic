@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -187,6 +188,14 @@ pub struct App {
     /// `context_tabs_mouse_press` (which shows `context_tab_menu`) and
     /// `close_context_menu_tab` (the menu's only item).
     context_tab_context_index: RefCell<Option<usize>>,
+    /// Subclass hooks for dynamically created Image List tabs (`build_context_tab_entry`).
+    /// `native_windows_derive`'s generated dispatch only subclasses `window` and the
+    /// children that exist when the app starts (`full_bind_event_handler`'s one-time
+    /// `EnumChildWindows` sweep); a `Tab`/`ListView` created later at runtime is invisible
+    /// to it, so once keyboard focus lands on one, shortcuts like Ctrl+W would otherwise
+    /// silently stop working. Each new tab gets its own hook bound the same way, kept
+    /// alive here for the app's lifetime.
+    context_tab_event_handlers: RefCell<Vec<nwg::EventHandler>>,
 
     #[nwg_control(title: "PhotoMatic", flags: "MAIN_WINDOW")]
     #[nwg_events(OnWindowClose: [App::exit], OnKeyPress: [App::on_key_press(SELF, EVT_DATA)])]
@@ -321,7 +330,7 @@ pub struct App {
     nav_tree_menu_open_explorer: nwg::MenuItem,
 
     #[nwg_control(parent: nav_tree_menu, text: "&Image List")]
-    #[nwg_events(OnMenuItemSelected: [App::open_image_list_tab])]
+    #[nwg_events(OnMenuItemSelected: [App::open_image_list_tab(RC_SELF)])]
     nav_tree_menu_image_list: nwg::MenuItem,
 
     #[nwg_control(parent: context_frame, flags: "VISIBLE")]
@@ -707,29 +716,31 @@ impl App {
     }
 
     /// The `nav_tree_menu`'s "Image List" item: opens (or switches to) the Context
-    /// Window tab for the directory/type last right-clicked in `nav_tree`.
-    fn open_image_list_tab(&self) {
-        let Some(dir_name) = self.nav_tree_context_dir.borrow_mut().take() else { return };
-        let image_type = self.nav_tree_context_type.borrow_mut().take();
+    /// Window tab for the directory/type last right-clicked in `nav_tree`. Takes `&Rc<App>`
+    /// (via `RC_SELF`) rather than plain `&self` because creating a tab needs one — see
+    /// `build_context_tab_entry`.
+    fn open_image_list_tab(app: &Rc<App>) {
+        let Some(dir_name) = app.nav_tree_context_dir.borrow_mut().take() else { return };
+        let image_type = app.nav_tree_context_type.borrow_mut().take();
         let title = context_tabs::tab_title(&dir_name, image_type.as_deref());
 
-        if let Some(index) = self.context_tabs.borrow().iter().position(|t| t.key == title) {
-            self.context_tabs_container.set_selected_tab(index);
-            self.sync_context_tab_visibility(&self.context_tabs.borrow());
+        if let Some(index) = app.context_tabs.borrow().iter().position(|t| t.key == title) {
+            app.context_tabs_container.set_selected_tab(index);
+            app.sync_context_tab_visibility(&app.context_tabs.borrow());
             return;
         }
 
         let rows = {
-            let db = self.db.borrow();
+            let db = app.db.borrow();
             let Some(db) = db.as_ref() else { return };
             db.list_images_by_directory(&dir_name, image_type.as_deref()).unwrap_or_default()
         };
 
-        let mut tabs = self.context_tabs.borrow_mut();
-        tabs.push(self.build_context_tab_entry(&title, &rows));
+        let mut tabs = app.context_tabs.borrow_mut();
+        tabs.push(Self::build_context_tab_entry(app, &title, &rows));
         let new_index = tabs.len() - 1;
-        self.context_tabs_container.set_selected_tab(new_index);
-        self.sync_context_tab_visibility(&tabs);
+        app.context_tabs_container.set_selected_tab(new_index);
+        app.sync_context_tab_visibility(&tabs);
     }
 
     /// Builds one Context Window tab: a `Tab` in `context_tabs_container` holding a
@@ -738,10 +749,14 @@ impl App {
     /// builder here, never via `Tab::set_text` afterwards — that method reads
     /// `GWL_USERDATA - 1` as the tab's index, which underflows for the very first tab
     /// (`GWL_USERDATA == 0`); the builder's own insertion path doesn't have that bug.
-    fn build_context_tab_entry(&self, title: &str, rows: &[db::models::ImageRecord]) -> ContextTabEntry {
+    ///
+    /// Needs `&Rc<App>`, not just `&self`, to rebind keyboard shortcuts onto the new
+    /// `Tab`/`ListView` at the end (see `context_tab_event_handlers`'s doc comment) — that
+    /// hook's closure must own a `'static` reference to the app to call back into it later.
+    fn build_context_tab_entry(app: &Rc<App>, title: &str, rows: &[db::models::ImageRecord]) -> ContextTabEntry {
         let mut tab = nwg::Tab::default();
         nwg::Tab::builder()
-            .parent(&self.context_tabs_container)
+            .parent(&app.context_tabs_container)
             .text(title)
             .build(&mut tab)
             .expect("Failed to build Image List tab");
@@ -780,6 +795,21 @@ impl App {
             .child_size(Size { width: D::Percent(1.0), height: D::Percent(1.0) })
             .build(&mut layout)
             .expect("Failed to build the Image List tab's layout");
+
+        // `tab` and its `list_view` child were both created after startup, so
+        // `native_windows_derive`'s one-time `EnumChildWindows` sweep never subclassed
+        // them — without this, keyboard shortcuts (Ctrl+W included) would go silent the
+        // moment focus lands in this tab. `full_bind_event_handler` recursively subclasses
+        // `tab` and everything already parented under it (`list_view`) in one call.
+        let app_weak = Rc::downgrade(app);
+        let handler = nwg::full_bind_event_handler(&tab.handle, move |evt, evt_data, _handle| {
+            if evt == nwg::Event::OnKeyPress {
+                if let Some(app) = app_weak.upgrade() {
+                    app.on_key_press(&evt_data);
+                }
+            }
+        });
+        app.context_tab_event_handlers.borrow_mut().push(handler);
 
         ContextTabEntry { key: title.to_string(), tab, list_view, layout }
     }
