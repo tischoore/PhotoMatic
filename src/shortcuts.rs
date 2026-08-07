@@ -7,6 +7,7 @@ pub enum ShortcutAction {
     Open,
     Save,
     SaveAs,
+    CloseTab,
 }
 
 /// Maps a virtual-key code and modifier state to the shortcut it represents, following the
@@ -22,6 +23,7 @@ pub fn resolve(key: u32, ctrl: bool, shift: bool) -> Option<ShortcutAction> {
         nwg::keys::_O => Some(ShortcutAction::Open),
         nwg::keys::_S if shift => Some(ShortcutAction::SaveAs),
         nwg::keys::_S => Some(ShortcutAction::Save),
+        nwg::keys::_W => Some(ShortcutAction::CloseTab),
         _ => None,
     }
 }
@@ -53,6 +55,11 @@ mod tests {
     #[test]
     fn ctrl_shift_s_is_save_as() {
         assert_eq!(resolve(nwg::keys::_S, true, true), Some(ShortcutAction::SaveAs));
+    }
+
+    #[test]
+    fn ctrl_w_is_close_tab() {
+        assert_eq!(resolve(nwg::keys::_W, true, false), Some(ShortcutAction::CloseTab));
     }
 
     #[test]

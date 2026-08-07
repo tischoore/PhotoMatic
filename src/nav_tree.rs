@@ -46,6 +46,12 @@ pub fn build(
         .collect()
 }
 
+/// Extracts the extension from a File Type leaf's label (`"jpg (12)"` -> `Some("jpg")`),
+/// the inverse of the `format!("{ext} ({count})")` used to build that label in `refresh_nav_tree`.
+pub fn parse_type_label(label: &str) -> Option<&str> {
+    label.split_once(" (").map(|(ext, _)| ext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +104,15 @@ mod tests {
         let extensions = FileExtensions { jpg: false, cr2: false, gif: false };
         let nodes = build(&[dir("sub")], &[], &extensions);
         assert_eq!(nodes, vec![NavDirNode { dir_name: "sub".to_string(), type_counts: vec![] }]);
+    }
+
+    #[test]
+    fn parse_type_label_extracts_extension_from_count_suffix() {
+        assert_eq!(parse_type_label("jpg (12)"), Some("jpg"));
+    }
+
+    #[test]
+    fn parse_type_label_returns_none_for_a_bare_string() {
+        assert_eq!(parse_type_label("50D"), None);
     }
 }

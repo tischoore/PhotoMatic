@@ -9,6 +9,7 @@ use native_windows_gui as nwg;
 use nwg::stretch::geometry::{Rect, Size};
 use nwg::stretch::style::{AlignItems, Dimension as D, FlexDirection, JustifyContent};
 
+use crate::context_tabs;
 use crate::db;
 use crate::exif;
 use crate::explorer;
@@ -105,6 +106,61 @@ fn tree_hit_test_at_cursor(tree: &nwg::TreeView) -> Option<nwg::TreeItem> {
     }
 }
 
+/// Removes the tab-strip header at `index` from `container`. `nwg::TabsContainer`/`Tab`
+/// has no `TCM_DELETEITEM` wrapper — `Tab::drop` (native-windows-gui 1.0.13) only destroys
+/// the tab's own content-pane HWND, not the tab-strip's separate header item — so this
+/// sends the message directly, the same low-level pattern `tree_hit_test_at_cursor` above
+/// uses for `TVM_HITTEST`. Without this, a closed tab's header lingers in the strip forever.
+fn remove_tab_strip_item(container: &nwg::TabsContainer, index: usize) {
+    use winapi::um::commctrl::TCM_DELETEITEM;
+
+    if let Some(hwnd) = container.handle.hwnd() {
+        unsafe {
+            winapi::um::winuser::SendMessageW(hwnd, TCM_DELETEITEM, index, 0);
+        }
+    }
+}
+
+/// Finds the tab-strip header index under the current cursor position, if any (`None` if
+/// the cursor isn't over a header) — the tab-strip analogue of `tree_hit_test_at_cursor`,
+/// using `TCM_HITTEST` since `nwg::TabsContainer` has no such query of its own. Unlike
+/// `TVM_HITTEST`, the hit item comes back as `TCM_HITTEST`'s return value itself, not a
+/// field on the info struct.
+fn tab_strip_hit_test_at_cursor(container: &nwg::TabsContainer) -> Option<usize> {
+    use winapi::shared::windef::POINT;
+    use winapi::um::commctrl::{TCHITTESTINFO, TCM_HITTEST};
+
+    let hwnd = container.handle.hwnd()?;
+    let (x, y) = nwg::GlobalCursor::local_position(container, None);
+
+    let mut hit_test = TCHITTESTINFO { pt: POINT { x, y }, flags: 0 };
+    let index = unsafe {
+        winapi::um::winuser::SendMessageW(hwnd, TCM_HITTEST, 0, &mut hit_test as *mut TCHITTESTINFO as isize)
+    };
+
+    if index < 0 {
+        None
+    } else {
+        Some(index as usize)
+    }
+}
+
+/// One open Context Window "Image List" tab.
+struct ContextTabEntry {
+    /// Also the tab's display title (`nav_tree`'s dir or "dir/type" name) — doubles as
+    /// the switch-vs-create lookup key.
+    key: String,
+    tab: nwg::Tab,
+    /// Never read after `build_context_tab_entry` populates it, but must be kept alive:
+    /// dropping it would run `nwg::ListView`'s `Drop` impl and destroy the table's HWND
+    /// out from under the still-visible tab.
+    #[allow(dead_code)]
+    list_view: nwg::ListView,
+    /// Same reasoning as `list_view` — kept alive so its layout keeps applying.
+    #[allow(dead_code)]
+    layout: nwg::FlexboxLayout,
+}
+
 #[derive(Default, NwgUi)]
 pub struct App {
     config: RefCell<AppConfig>,
@@ -116,9 +172,21 @@ pub struct App {
     db: RefCell<Option<db::ProjectDb>>,
     db_open_thread: RefCell<Option<thread::JoinHandle<Result<db::ProjectDb, db::DbError>>>>,
     /// The top-level directory right-clicked in `nav_tree`, remembered between
-    /// `nav_tree_right_click` (which shows `nav_tree_menu`) and
-    /// `open_selected_dir_in_explorer` (the menu's only item).
+    /// `nav_tree_right_click` (which shows `nav_tree_menu`) and its menu items
+    /// (`open_selected_dir_in_explorer`, `open_image_list_tab`).
     nav_tree_context_dir: RefCell<Option<String>>,
+    /// The File Type extension right-clicked (leaf node only; `None` for a directory-node
+    /// right-click), stashed alongside `nav_tree_context_dir` for `open_image_list_tab`.
+    nav_tree_context_type: RefCell<Option<String>>,
+    /// Open Context Window tabs, left-to-right in the same order as
+    /// `context_tabs_container`'s native tab strip — always kept contiguous: `close_tab_at`
+    /// removes exactly the closed tab's entry, and Win32 itself shifts the remaining
+    /// native tab-strip positions down to match.
+    context_tabs: RefCell<Vec<ContextTabEntry>>,
+    /// The tab-strip index right-clicked in `context_tabs_container`, remembered between
+    /// `context_tabs_mouse_press` (which shows `context_tab_menu`) and
+    /// `close_context_menu_tab` (the menu's only item).
+    context_tab_context_index: RefCell<Option<usize>>,
 
     #[nwg_control(title: "PhotoMatic", flags: "MAIN_WINDOW")]
     #[nwg_events(OnWindowClose: [App::exit], OnKeyPress: [App::on_key_press(SELF, EVT_DATA)])]
@@ -252,6 +320,24 @@ pub struct App {
     #[nwg_events(OnMenuItemSelected: [App::open_selected_dir_in_explorer])]
     nav_tree_menu_open_explorer: nwg::MenuItem,
 
+    #[nwg_control(parent: nav_tree_menu, text: "&Image List")]
+    #[nwg_events(OnMenuItemSelected: [App::open_image_list_tab])]
+    nav_tree_menu_image_list: nwg::MenuItem,
+
+    #[nwg_control(parent: context_frame, flags: "VISIBLE")]
+    #[nwg_events(
+        TabsContainerChanged: [App::context_tab_selection_changed],
+        OnMousePress: [App::context_tabs_mouse_press(SELF, EVT)],
+    )]
+    context_tabs_container: nwg::TabsContainer,
+
+    #[nwg_control(parent: window, popup: true)]
+    context_tab_menu: nwg::Menu,
+
+    #[nwg_control(parent: context_tab_menu, text: "&Close Tab")]
+    #[nwg_events(OnMenuItemSelected: [App::close_context_menu_tab])]
+    context_tab_menu_close: nwg::MenuItem,
+
     body_layout: nwg::FlexboxLayout,
     root_layout: nwg::FlexboxLayout,
     project_info_layout: nwg::FlexboxLayout,
@@ -262,6 +348,7 @@ pub struct App {
     scan_column_layout: nwg::FlexboxLayout,
     metadata_column_layout: nwg::FlexboxLayout,
     nav_layout: nwg::FlexboxLayout,
+    context_layout: nwg::FlexboxLayout,
 }
 
 impl App {
@@ -428,6 +515,15 @@ impl App {
             .child_size(Size { width: D::Percent(1.0), height: D::Percent(1.0) })
             .build(&self.nav_layout)
             .expect("Failed to build the Left Navigation layout");
+
+        // The tab strip fills the entire Context Window.
+        nwg::FlexboxLayout::builder()
+            .parent(&self.context_frame)
+            .padding(Rect { start: D::Points(8.0), end: D::Points(8.0), top: D::Points(8.0), bottom: D::Points(8.0) })
+            .child(&self.context_tabs_container)
+            .child_size(Size { width: D::Percent(1.0), height: D::Percent(1.0) })
+            .build(&self.context_layout)
+            .expect("Failed to build the Context Window layout");
     }
 
     fn exit(&self) {
@@ -446,6 +542,7 @@ impl App {
             Some(ShortcutAction::Open) => self.file_load(),
             Some(ShortcutAction::Save) => self.file_save(),
             Some(ShortcutAction::SaveAs) => self.file_save_as(),
+            Some(ShortcutAction::CloseTab) => self.close_active_tab(),
             None => {}
         }
     }
@@ -571,22 +668,34 @@ impl App {
 
     /// Fired via `OnTreeViewRightClick`. `nwg::TreeView` doesn't change selection on a
     /// right click and has no "item under cursor" query, so the item is found with a
-    /// manual `TVM_HITTEST` at the current cursor position. Only top-level directory
-    /// nodes (no parent) get the context menu — the `jpg (n)`/`cr2 (n)`/`gif (n)`
-    /// children don't have a folder of their own to open.
+    /// manual `TVM_HITTEST` at the current cursor position. Both top-level directory
+    /// nodes and their `jpg (n)`/`cr2 (n)`/`gif (n)` File Type children get the menu —
+    /// the directory name and (for a leaf) its extension are stashed for the menu items.
     fn nav_tree_right_click(&self) {
         let Some(item) = tree_hit_test_at_cursor(&self.nav_tree) else { return };
-        if self.nav_tree.parent(&item).is_some() {
-            return;
-        }
 
-        *self.nav_tree_context_dir.borrow_mut() = self.nav_tree.item_text(&item);
+        let (dir_name, image_type) = match self.nav_tree.parent(&item) {
+            Some(parent) => {
+                let Some(dir_name) = self.nav_tree.item_text(&parent) else { return };
+                let label = self.nav_tree.item_text(&item).unwrap_or_default();
+                (dir_name, nav_tree::parse_type_label(&label).map(str::to_string))
+            }
+            None => {
+                let Some(dir_name) = self.nav_tree.item_text(&item) else { return };
+                (dir_name, None)
+            }
+        };
+
+        *self.nav_tree_context_dir.borrow_mut() = Some(dir_name);
+        *self.nav_tree_context_type.borrow_mut() = image_type;
         let (x, y) = nwg::GlobalCursor::position();
         self.nav_tree_menu.popup(x, y);
     }
 
-    /// The `nav_tree_menu`'s only item: opens Windows Explorer at the top-level
-    /// directory last right-clicked in `nav_tree` (recorded by `nav_tree_right_click`).
+    /// The `nav_tree_menu`'s "Open in Explorer" item: opens Windows Explorer at the
+    /// top-level directory last right-clicked in `nav_tree` (recorded by
+    /// `nav_tree_right_click`) — the same folder regardless of whether a directory node
+    /// or one of its File Type children was clicked.
     fn open_selected_dir_in_explorer(&self) {
         let Some(dir_name) = self.nav_tree_context_dir.borrow_mut().take() else { return };
         let Some(source_dir) = self.project.borrow().source_directory.clone() else { return };
@@ -595,6 +704,170 @@ impl App {
         if let Err(err) = explorer::open(&path) {
             nwg::simple_message("PhotoMatic", &format!("Failed to open Explorer: {err}"));
         }
+    }
+
+    /// The `nav_tree_menu`'s "Image List" item: opens (or switches to) the Context
+    /// Window tab for the directory/type last right-clicked in `nav_tree`.
+    fn open_image_list_tab(&self) {
+        let Some(dir_name) = self.nav_tree_context_dir.borrow_mut().take() else { return };
+        let image_type = self.nav_tree_context_type.borrow_mut().take();
+        let title = context_tabs::tab_title(&dir_name, image_type.as_deref());
+
+        if let Some(index) = self.context_tabs.borrow().iter().position(|t| t.key == title) {
+            self.context_tabs_container.set_selected_tab(index);
+            self.sync_context_tab_visibility(&self.context_tabs.borrow());
+            return;
+        }
+
+        let rows = {
+            let db = self.db.borrow();
+            let Some(db) = db.as_ref() else { return };
+            db.list_images_by_directory(&dir_name, image_type.as_deref()).unwrap_or_default()
+        };
+
+        let mut tabs = self.context_tabs.borrow_mut();
+        tabs.push(self.build_context_tab_entry(&title, &rows));
+        let new_index = tabs.len() - 1;
+        self.context_tabs_container.set_selected_tab(new_index);
+        self.sync_context_tab_visibility(&tabs);
+    }
+
+    /// Builds one Context Window tab: a `Tab` in `context_tabs_container` holding a
+    /// `ListView` (Detailed/report style, so it gets a native vertical scrollbar for
+    /// free) populated with `rows`. The tab's title is only ever set via the `Tab`
+    /// builder here, never via `Tab::set_text` afterwards — that method reads
+    /// `GWL_USERDATA - 1` as the tab's index, which underflows for the very first tab
+    /// (`GWL_USERDATA == 0`); the builder's own insertion path doesn't have that bug.
+    fn build_context_tab_entry(&self, title: &str, rows: &[db::models::ImageRecord]) -> ContextTabEntry {
+        let mut tab = nwg::Tab::default();
+        nwg::Tab::builder()
+            .parent(&self.context_tabs_container)
+            .text(title)
+            .build(&mut tab)
+            .expect("Failed to build Image List tab");
+
+        let mut list_view = nwg::ListView::default();
+        nwg::ListView::builder()
+            .parent(&tab)
+            .list_style(nwg::ListViewStyle::Detailed)
+            .flags(nwg::ListViewFlags::VISIBLE | nwg::ListViewFlags::TAB_STOP)
+            .ex_flags(nwg::ListViewExFlags::FULL_ROW_SELECT | nwg::ListViewExFlags::GRID)
+            .build(&mut list_view)
+            .expect("Failed to build Image List table");
+
+        for (index, (column_title, width)) in context_tabs::COLUMNS.iter().enumerate() {
+            list_view.insert_column(nwg::InsertListViewColumn {
+                index: Some(index as i32),
+                text: Some((*column_title).to_string()),
+                width: Some(*width),
+                ..Default::default()
+            });
+        }
+        list_view.set_headers_enabled(true);
+
+        for record in rows {
+            let items: Vec<nwg::InsertListViewItem> = context_tabs::image_row(record)
+                .into_iter()
+                .map(|text| nwg::InsertListViewItem { text: Some(text), ..Default::default() })
+                .collect();
+            list_view.insert_items_row(None, &items);
+        }
+
+        let mut layout = nwg::FlexboxLayout::default();
+        nwg::FlexboxLayout::builder()
+            .parent(&tab)
+            .child(&list_view)
+            .child_size(Size { width: D::Percent(1.0), height: D::Percent(1.0) })
+            .build(&mut layout)
+            .expect("Failed to build the Image List tab's layout");
+
+        ContextTabEntry { key: title.to_string(), tab, list_view, layout }
+    }
+
+    /// Corrects `context_tabs_container`'s per-tab visibility ourselves: the underlying
+    /// Win32 tab control's built-in show/hide bookkeeping (native-windows-gui 1.0.13) is
+    /// off-by-one, so every call site that selects a tab (including here, in response to
+    /// a genuine user click) re-derives visibility from our own contiguous `context_tabs`
+    /// ordering instead of trusting it.
+    fn sync_context_tab_visibility(&self, tabs: &[ContextTabEntry]) {
+        let selected = self.context_tabs_container.selected_tab();
+        for (i, entry) in tabs.iter().enumerate() {
+            entry.tab.set_visible(i == selected);
+        }
+    }
+
+    /// Fired via `TabsContainerChanged` — i.e. only for a genuine user click on the tab
+    /// strip (programmatic `set_selected_tab` calls do NOT raise this event, which is why
+    /// every code path that calls `set_selected_tab` also calls
+    /// `sync_context_tab_visibility` directly).
+    fn context_tab_selection_changed(&self) {
+        self.sync_context_tab_visibility(&self.context_tabs.borrow());
+    }
+
+    /// Closes the Context Window tab currently active (Ctrl+W's target — there's no
+    /// per-tab "x", so Ctrl+W always acts on whichever tab is selected).
+    fn close_active_tab(&self) {
+        self.close_tab_at(self.context_tabs_container.selected_tab());
+    }
+
+    /// Closes the tab at tab-strip position `index`, regardless of whether it's the
+    /// active one (used by both `close_active_tab` and the right-click "Close Tab" menu
+    /// item, which can target a background tab). Removes its native tab-strip header via
+    /// `remove_tab_strip_item` (see that function's doc comment for why that can't just be
+    /// left to `Drop`) and drops its `ContextTabEntry`, which destroys its content-pane/
+    /// `ListView`/layout HWNDs. The surviving tabs' `Tab`/`ListView` controls are left
+    /// untouched — no rebuild needed, since `TCM_DELETEITEM` makes Win32 itself shift their
+    /// tab-strip positions down to stay contiguous, and none of our own logic reads the
+    /// crate's internal (buggy, see `sync_context_tab_visibility`) per-tab bookkeeping that
+    /// a deletion might leave stale. The selection is then explicitly re-derived (never
+    /// trusting Win32's own post-deletion auto-selection): closing the active tab lands on
+    /// its old slot; closing a background tab keeps the same tab selected, shifted left by
+    /// one if it sat after the one just removed.
+    fn close_tab_at(&self, index: usize) {
+        let mut tabs = self.context_tabs.borrow_mut();
+        if index >= tabs.len() {
+            return;
+        }
+        let selected_before = self.context_tabs_container.selected_tab();
+
+        remove_tab_strip_item(&self.context_tabs_container, index);
+        tabs.remove(index);
+
+        if tabs.is_empty() {
+            return;
+        }
+
+        let next = match selected_before.cmp(&index) {
+            std::cmp::Ordering::Less => selected_before,
+            std::cmp::Ordering::Equal => index.min(tabs.len() - 1),
+            std::cmp::Ordering::Greater => selected_before - 1,
+        };
+        self.context_tabs_container.set_selected_tab(next);
+        self.sync_context_tab_visibility(&tabs);
+    }
+
+    /// Fired via `OnMousePress` on `context_tabs_container`. Only a right-button release
+    /// over an actual tab header (not the content pane below it, which belongs to the
+    /// active `Tab`/`ListView` child window and never reaches this handler) shows
+    /// `context_tab_menu`; the tab-strip index under the cursor is found the same way
+    /// `nav_tree_right_click` finds a tree item, via a manual hit-test.
+    fn context_tabs_mouse_press(&self, evt: nwg::Event) {
+        if evt != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressRightUp) {
+            return;
+        }
+        let Some(index) = tab_strip_hit_test_at_cursor(&self.context_tabs_container) else { return };
+
+        *self.context_tab_context_index.borrow_mut() = Some(index);
+        let (x, y) = nwg::GlobalCursor::position();
+        self.context_tab_menu.popup(x, y);
+    }
+
+    /// The `context_tab_menu`'s only item: closes the tab last right-clicked in
+    /// `context_tabs_container` (recorded by `context_tabs_mouse_press`), which may not be
+    /// the currently active one.
+    fn close_context_menu_tab(&self) {
+        let Some(index) = self.context_tab_context_index.borrow_mut().take() else { return };
+        self.close_tab_at(index);
     }
 
     /// Refreshes the project's cached `database_schema_version`/`database_last_modified`

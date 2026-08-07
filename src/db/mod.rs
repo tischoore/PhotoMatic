@@ -133,6 +133,16 @@ impl ProjectDb {
     pub fn directory_type_counts(&self) -> Result<Vec<(Option<String>, String, i64)>, DbError> {
         images::count_by_directory_and_type(&self.conn)
     }
+
+    /// Images under a top-level directory, optionally filtered to one File Type, for the
+    /// Context Window's "Image List" tabs.
+    pub fn list_images_by_directory(
+        &self,
+        toplevel_dir: &str,
+        image_type: Option<&str>,
+    ) -> Result<Vec<models::ImageRecord>, DbError> {
+        images::list_images_by_directory(&self.conn, toplevel_dir, image_type)
+    }
 }
 
 /// Normalizes a relative path to forward-slash (POSIX) separators, regardless of the
@@ -314,6 +324,58 @@ mod tests {
         assert_eq!(counts.len(), 2);
         assert!(counts.contains(&(None, "jpg".to_string(), 1)));
         assert!(counts.contains(&(Some("sub".to_string()), "cr2".to_string(), 1)));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn list_images_by_directory_filters_by_directory_and_optional_type() {
+        let path = temp_db_path("list-images-by-directory");
+        std::fs::remove_file(&path).ok();
+        let mut db = ProjectDb::open(&path).unwrap();
+
+        let units = vec![
+            ScanUnit::ToplevelDir {
+                name: "50D".to_string(),
+                files: vec![
+                    ScannedFile {
+                        relative_path: PathBuf::from("50D").join("a.jpg"),
+                        extension: "jpg".to_string(),
+                        toplevel_dir: Some("50D".to_string()),
+                    },
+                    ScannedFile {
+                        relative_path: PathBuf::from("50D").join("b.jpg"),
+                        extension: "jpg".to_string(),
+                        toplevel_dir: Some("50D".to_string()),
+                    },
+                    ScannedFile {
+                        relative_path: PathBuf::from("50D").join("c.cr2"),
+                        extension: "cr2".to_string(),
+                        toplevel_dir: Some("50D".to_string()),
+                    },
+                ],
+            },
+            ScanUnit::ToplevelDir {
+                name: "other".to_string(),
+                files: vec![ScannedFile {
+                    relative_path: PathBuf::from("other").join("d.jpg"),
+                    extension: "jpg".to_string(),
+                    toplevel_dir: Some("other".to_string()),
+                }],
+            },
+        ];
+        apply_units(&mut db, &units);
+
+        assert_eq!(db.list_images_by_directory("50D", None).unwrap().len(), 3);
+        assert_eq!(
+            db.list_images_by_directory("50D", Some("jpg"))
+                .unwrap()
+                .iter()
+                .map(|i| i.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["50D/a.jpg", "50D/b.jpg"],
+        );
+        assert!(db.list_images_by_directory("nonexistent", None).unwrap().is_empty());
 
         std::fs::remove_file(&path).ok();
     }

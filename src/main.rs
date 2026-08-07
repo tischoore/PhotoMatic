@@ -2,6 +2,7 @@
 
 mod about_modal;
 mod app;
+mod context_tabs;
 mod db;
 mod exif;
 mod explorer;
