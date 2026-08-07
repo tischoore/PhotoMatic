@@ -545,17 +545,20 @@ impl App {
     }
 
     /// Rebuilds `nav_tree` from the database's current `directories`/`images` rows:
-    /// one root node per top-level directory, sorted, each with fixed `jpg`/`cr2`/`gif`
-    /// count children. Called whenever the database changes under the tree — after a
-    /// project load and after a scan — so the tree never drifts from what's stored.
+    /// one root node per top-level directory, sorted, each with a count child per
+    /// currently-enabled File Type (a disabled type gets no node at all). Called
+    /// whenever the database or the File Types selection changes under the tree —
+    /// after a project load, after a scan, and after a File Types checkbox toggle —
+    /// so the tree never drifts from what's stored or selected.
     fn refresh_nav_tree(&self) {
         self.nav_tree.clear();
 
         let db = self.db.borrow();
         let Some(db) = db.as_ref() else { return };
         let (Ok(dirs), Ok(counts)) = (db.list_directories(), db.directory_type_counts()) else { return };
+        let extensions = self.project.borrow().file_extensions.clone();
 
-        for node in nav_tree::build(&dirs, &counts) {
+        for node in nav_tree::build(&dirs, &counts, &extensions) {
             let dir_item = self.nav_tree.insert_item(&node.dir_name, None, nwg::TreeInsert::Sort);
             for (ext, count) in &node.type_counts {
                 self.nav_tree.insert_item(&format!("{ext} ({count})"), Some(&dir_item), nwg::TreeInsert::Last);
@@ -733,13 +736,16 @@ impl App {
             if text.is_empty() { None } else { Some(PathBuf::from(text)) };
     }
 
-    /// Writes the File Types checkboxes' current state into `self.project`.
+    /// Writes the File Types checkboxes' current state into `self.project`, then
+    /// refreshes the Left Navigation tree so a disabled type's nodes disappear (and a
+    /// re-enabled type's nodes reappear) immediately, without requiring a rescan.
     fn sync_file_extensions_from_checkboxes(&self) {
         self.project.borrow_mut().file_extensions = FileExtensions {
             jpg: self.file_type_jpg.check_state() == nwg::CheckBoxState::Checked,
             cr2: self.file_type_cr2.check_state() == nwg::CheckBoxState::Checked,
             gif: self.file_type_gif.check_state() == nwg::CheckBoxState::Checked,
         };
+        self.refresh_nav_tree();
     }
 
     /// Sets the File Types checkboxes to reflect `extensions` — used when starting a new
