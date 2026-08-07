@@ -223,7 +223,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
 
         std::fs::remove_file(&path).ok();
     }
@@ -401,6 +401,9 @@ mod tests {
             exposure_time_seconds: Some(1.0 / 500.0),
             iso: Some(200),
             focal_length_mm: Some(50.0),
+            gps_latitude: Some(40.446_333),
+            gps_longitude: Some(-79.982),
+            gps_altitude_m: Some(123.4),
         }
     }
 
@@ -440,6 +443,9 @@ mod tests {
         assert_eq!(image.exposure_time, metadata.exposure_time_seconds);
         assert_eq!(image.iso, metadata.iso);
         assert_eq!(image.focal_length, metadata.focal_length_mm);
+        assert_eq!(image.gps_latitude, metadata.gps_latitude);
+        assert_eq!(image.gps_longitude, metadata.gps_longitude);
+        assert_eq!(image.gps_altitude, metadata.gps_altitude_m);
         assert!(image.metadata_read_at.is_some());
 
         std::fs::remove_file(&path).ok();

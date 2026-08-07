@@ -1,7 +1,7 @@
 use crate::db::models::ImageRecord;
 
 /// Column headers, in display order, paired with a pixel width for `ListView::insert_column`.
-pub const COLUMNS: [(&str, i32); 7] = [
+pub const COLUMNS: [(&str, i32); 9] = [
     ("Path", 320),
     ("Date taken", 150),
     ("Width", 70),
@@ -9,6 +9,8 @@ pub const COLUMNS: [(&str, i32); 7] = [
     ("Focal length", 100),
     ("ISO", 70),
     ("Exposure time", 110),
+    ("Location", 150),
+    ("Altitude", 80),
 ];
 
 /// The Context Window tab's display name/lookup key for an "Image List" action:
@@ -20,9 +22,9 @@ pub fn tab_title(dir: &str, image_type: Option<&str>) -> String {
     }
 }
 
-/// One `ImageRecord` as the 7 display strings, in `COLUMNS` order. `None` fields render
+/// One `ImageRecord` as the 9 display strings, in `COLUMNS` order. `None` fields render
 /// as an empty string (blank cell) rather than a placeholder like "N/A".
-pub fn image_row(record: &ImageRecord) -> [String; 7] {
+pub fn image_row(record: &ImageRecord) -> [String; 9] {
     [
         record.path.clone(),
         record.date_taken.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default(),
@@ -31,6 +33,8 @@ pub fn image_row(record: &ImageRecord) -> [String; 7] {
         record.focal_length.map(|f| format!("{f:.1}mm")).unwrap_or_default(),
         record.iso.map(|i| i.to_string()).unwrap_or_default(),
         format_exposure_time(record.exposure_time),
+        format_gps_coordinates(record.gps_latitude, record.gps_longitude),
+        format_gps_altitude(record.gps_altitude),
     ]
 }
 
@@ -43,6 +47,19 @@ fn format_exposure_time(seconds: Option<f64>) -> String {
         Some(s) if s > 0.0 => format!("{s:.1}s"),
         _ => String::new(),
     }
+}
+
+/// `"{lat}, {lon}"` to 5 decimal places (~1.1m precision) when both are present; blank
+/// otherwise — a coordinate needs both halves to mean anything.
+fn format_gps_coordinates(lat: Option<f64>, lon: Option<f64>) -> String {
+    match (lat, lon) {
+        (Some(lat), Some(lon)) => format!("{lat:.5}, {lon:.5}"),
+        _ => String::new(),
+    }
+}
+
+fn format_gps_altitude(meters: Option<f64>) -> String {
+    meters.map(|m| format!("{m:.0}m")).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -73,6 +90,9 @@ mod tests {
             exposure_time: Some(0.008),
             iso: Some(400),
             focal_length: Some(50.0),
+            gps_latitude: Some(40.446_33),
+            gps_longitude: Some(-79.982),
+            gps_altitude: Some(123.4),
             metadata_read_at: None,
         };
         assert_eq!(
@@ -85,6 +105,8 @@ mod tests {
                 "50.0mm".to_string(),
                 "400".to_string(),
                 "1/125s".to_string(),
+                "40.44633, -79.98200".to_string(),
+                "123m".to_string(),
             ]
         );
     }
@@ -102,12 +124,17 @@ mod tests {
             exposure_time: None,
             iso: None,
             focal_length: None,
+            gps_latitude: None,
+            gps_longitude: None,
+            gps_altitude: None,
             metadata_read_at: None,
         };
         assert_eq!(
             image_row(&record),
             [
                 "50D/a.jpg".to_string(),
+                String::new(),
+                String::new(),
                 String::new(),
                 String::new(),
                 String::new(),
@@ -126,5 +153,28 @@ mod tests {
     #[test]
     fn image_row_formats_one_second_or_longer_exposure_as_decimal_seconds() {
         assert_eq!(format_exposure_time(Some(2.0)), "2.0s");
+    }
+
+    #[test]
+    fn format_gps_coordinates_formats_both_present_to_five_decimals() {
+        assert_eq!(format_gps_coordinates(Some(40.446_33), Some(-79.982)), "40.44633, -79.98200");
+    }
+
+    #[test]
+    fn format_gps_coordinates_blanks_when_either_half_is_missing() {
+        assert_eq!(format_gps_coordinates(Some(40.446_33), None), "");
+        assert_eq!(format_gps_coordinates(None, Some(-79.982)), "");
+        assert_eq!(format_gps_coordinates(None, None), "");
+    }
+
+    #[test]
+    fn format_gps_altitude_formats_meters_rounded_to_whole_numbers() {
+        assert_eq!(format_gps_altitude(Some(123.4)), "123m");
+        assert_eq!(format_gps_altitude(Some(-5.6)), "-6m");
+    }
+
+    #[test]
+    fn format_gps_altitude_blanks_when_absent() {
+        assert_eq!(format_gps_altitude(None), "");
     }
 }

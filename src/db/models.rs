@@ -25,6 +25,11 @@ pub struct ImageRecord {
     pub exposure_time: Option<f64>,
     pub iso: Option<u32>,
     pub focal_length: Option<f64>,
+    /// Decimal degrees (WGS84), signed — north/east positive.
+    pub gps_latitude: Option<f64>,
+    pub gps_longitude: Option<f64>,
+    /// Meters, signed — below sea level negative.
+    pub gps_altitude: Option<f64>,
     /// When EXIF metadata extraction was last attempted for this row (regardless of
     /// whether any tag was found). `None` means Generate MetaData hasn't processed
     /// it yet — this is the marker `list_images_pending_metadata` filters on.

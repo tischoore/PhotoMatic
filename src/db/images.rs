@@ -32,7 +32,7 @@ pub fn upsert_images(conn: &mut Connection, images: &[ImageRecord]) -> Result<()
 }
 
 const IMAGE_COLUMNS: &str = "key, path, image_type, toplevel_dir, date_taken, width, height, \
-     exposure_time, iso, focal_length, metadata_read_at";
+     exposure_time, iso, focal_length, gps_latitude, gps_longitude, gps_altitude, metadata_read_at";
 
 fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord> {
     Ok(ImageRecord {
@@ -46,7 +46,10 @@ fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord> {
         exposure_time: row.get(7)?,
         iso: row.get(8)?,
         focal_length: row.get(9)?,
-        metadata_read_at: row.get(10)?,
+        gps_latitude: row.get(10)?,
+        gps_longitude: row.get(11)?,
+        gps_altitude: row.get(12)?,
+        metadata_read_at: row.get(13)?,
     })
 }
 
@@ -78,7 +81,8 @@ pub fn list_images_pending_metadata(conn: &Connection) -> Result<Vec<ImageRecord
 pub fn update_metadata(conn: &Connection, key: &str, metadata: &crate::exif::ImageMetadata) -> Result<(), DbError> {
     conn.execute(
         "UPDATE images SET date_taken = ?2, width = ?3, height = ?4, exposure_time = ?5, iso = ?6, \
-         focal_length = ?7, metadata_read_at = ?8 WHERE key = ?1",
+         focal_length = ?7, gps_latitude = ?8, gps_longitude = ?9, gps_altitude = ?10, \
+         metadata_read_at = ?11 WHERE key = ?1",
         rusqlite::params![
             key,
             metadata.date_taken,
@@ -87,6 +91,9 @@ pub fn update_metadata(conn: &Connection, key: &str, metadata: &crate::exif::Ima
             metadata.exposure_time_seconds,
             metadata.iso,
             metadata.focal_length_mm,
+            metadata.gps_latitude,
+            metadata.gps_longitude,
+            metadata.gps_altitude_m,
             chrono::Utc::now().naive_utc(),
         ],
     )
