@@ -37,6 +37,9 @@ pub struct ProjectFile {
 
 /// The Generate Events button's per-tier gap thresholds: two photos in the same tier's
 /// group when the gap since the previous one, sorted by `date_taken`, is at most this value.
+/// `session_max_distance_km`/`multi_hour_max_distance_km` additionally split a group wherever
+/// the GPS distance since the previous photo (when both have GPS) exceeds them; there is no
+/// distance threshold for Tight Burst, since GPS noise isn't meaningful at that time scale.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventThresholds {
     #[serde(default = "EventThresholds::default_burst_seconds")]
@@ -45,6 +48,10 @@ pub struct EventThresholds {
     pub session_gap_minutes: u32,
     #[serde(default = "EventThresholds::default_multi_hour_hours")]
     pub multi_hour_gap_hours: u32,
+    #[serde(default = "EventThresholds::default_session_distance_km")]
+    pub session_max_distance_km: f64,
+    #[serde(default = "EventThresholds::default_multi_hour_distance_km")]
+    pub multi_hour_max_distance_km: f64,
 }
 
 impl EventThresholds {
@@ -60,6 +67,14 @@ impl EventThresholds {
         8
     }
 
+    fn default_session_distance_km() -> f64 {
+        2.0
+    }
+
+    fn default_multi_hour_distance_km() -> f64 {
+        50.0
+    }
+
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
@@ -71,6 +86,8 @@ impl Default for EventThresholds {
             burst_gap_seconds: Self::default_burst_seconds(),
             session_gap_minutes: Self::default_session_minutes(),
             multi_hour_gap_hours: Self::default_multi_hour_hours(),
+            session_max_distance_km: Self::default_session_distance_km(),
+            multi_hour_max_distance_km: Self::default_multi_hour_distance_km(),
         }
     }
 }
@@ -211,10 +228,16 @@ mod tests {
     }
 
     #[test]
-    fn event_thresholds_default_to_10s_60min_8h() {
+    fn event_thresholds_default_to_10s_60min_8h_2km_50km() {
         assert_eq!(
             EventThresholds::default(),
-            EventThresholds { burst_gap_seconds: 10, session_gap_minutes: 60, multi_hour_gap_hours: 8 }
+            EventThresholds {
+                burst_gap_seconds: 10,
+                session_gap_minutes: 60,
+                multi_hour_gap_hours: 8,
+                session_max_distance_km: 2.0,
+                multi_hour_max_distance_km: 50.0,
+            }
         );
     }
 
@@ -222,7 +245,13 @@ mod tests {
     fn round_trips_event_thresholds_through_json() {
         let path = temp_path("project-event-thresholds.json");
         let project = ProjectFile {
-            event_thresholds: EventThresholds { burst_gap_seconds: 5, session_gap_minutes: 30, multi_hour_gap_hours: 6 },
+            event_thresholds: EventThresholds {
+                burst_gap_seconds: 5,
+                session_gap_minutes: 30,
+                multi_hour_gap_hours: 6,
+                session_max_distance_km: 1.5,
+                multi_hour_max_distance_km: 25.0,
+            },
             ..ProjectFile::default()
         };
 

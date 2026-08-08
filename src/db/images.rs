@@ -31,10 +31,13 @@ pub fn upsert_images(conn: &mut Connection, images: &[ImageRecord]) -> Result<()
     Ok(())
 }
 
-const IMAGE_COLUMNS: &str = "key, path, image_type, toplevel_dir, date_taken, width, height, \
+/// Visible to the rest of `db` (in particular `db::events`'s `event_images` query) so an
+/// event's photo table can be built with the same column set/order as every other
+/// `ImageRecord` query, without duplicating it.
+pub(super) const IMAGE_COLUMNS: &str = "key, path, image_type, toplevel_dir, date_taken, width, height, \
      exposure_time, iso, focal_length, gps_latitude, gps_longitude, gps_altitude, metadata_read_at";
 
-fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord> {
+pub(super) fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord> {
     Ok(ImageRecord {
         key: row.get(0)?,
         path: row.get(1)?,

@@ -22,6 +22,15 @@ pub fn tab_title(dir: &str, image_type: Option<&str>) -> String {
     }
 }
 
+/// The Context Window tab's display name/lookup key for an event tab. A stable,
+/// id-based identifier rather than the event's (editable) title: `nwg::Tab::set_text`
+/// underflows for the first tab in the strip (see `App::build_context_tab_entry`'s doc
+/// comment), so an event tab's header can never be renamed after creation — the live
+/// title is shown in the tab's title input and the tree instead.
+pub fn event_tab_title(event_id: i64) -> String {
+    format!("Event #{event_id}")
+}
+
 /// One `ImageRecord` as the 9 display strings, in `COLUMNS` order. `None` fields render
 /// as an empty string (blank cell) rather than a placeholder like "N/A".
 pub fn image_row(record: &ImageRecord) -> [String; 9] {
@@ -75,6 +84,11 @@ mod tests {
     #[test]
     fn tab_title_for_directory_and_type() {
         assert_eq!(tab_title("50D", Some("jpg")), "50D/jpg");
+    }
+
+    #[test]
+    fn event_tab_title_is_stable_and_id_based() {
+        assert_eq!(event_tab_title(7), "Event #7");
     }
 
     #[test]

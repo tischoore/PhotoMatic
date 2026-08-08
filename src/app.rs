@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
@@ -12,6 +12,7 @@ use nwg::stretch::style::{AlignItems, Dimension as D, FlexDirection, JustifyCont
 
 use crate::context_tabs;
 use crate::db;
+use crate::event_tree;
 use crate::exif;
 use crate::explorer;
 use crate::nav_tree;
@@ -26,7 +27,7 @@ use crate::window_mode;
 const PROJECT_FILTER: &str = "PhotoMatic Project(*.json)";
 
 /// Height of the Project Information strip, in points (`FlexboxLayout` units).
-const PROJECT_INFO_HEIGHT: f32 = 182.0;
+const PROJECT_INFO_HEIGHT: f32 = 218.0;
 /// Width of the Left Navigation panel, as a fraction of the space below Project Information.
 const NAV_WIDTH_PERCENT: f32 = 0.2;
 /// Width of the Context Window, as a fraction of the space below Project Information.
@@ -57,14 +58,20 @@ const PROJECT_INFO_ROW_GAP: f32 = 8.0;
 /// Height of `top_block_frame` (Source Directory + File Types). Same reasoning as the
 /// leaf-control note above — `top_block_frame` is itself a leaf as far as `project_info_layout`
 /// is concerned, so its `Dimension::Auto` would resolve to 0 rather than its content height.
-/// Height of the Event Gaps row, directly below File Types.
+/// Height of the Event Gaps row, directly below File Types. Also shared by the Event Distance
+/// row directly below it — both are single-line label/input/unit rows of the same height.
 const EVENT_THRESHOLDS_ROW_HEIGHT: f32 = 28.0;
-/// Width of each Event Gaps numeric input (Burst/Session/Multi-hour).
+/// Width of each Event Gaps/Event Distance numeric input (Burst/Session/Multi-hour, Session/Multi-hour km).
 const EVENT_THRESHOLD_INPUT_WIDTH: f32 = 45.0;
-/// Width of each Event Gaps unit label ("sec"/"min"/"hr") following its input.
+/// Width of each Event Gaps/Event Distance unit label ("sec"/"min"/"hr"/"km") following its input.
 const EVENT_THRESHOLD_UNIT_LABEL_WIDTH: f32 = 34.0;
-const TOP_BLOCK_HEIGHT: f32 =
-    SOURCE_DIR_ROW_HEIGHT + PROJECT_INFO_ROW_GAP + FILE_TYPES_ROW_HEIGHT + PROJECT_INFO_ROW_GAP + EVENT_THRESHOLDS_ROW_HEIGHT;
+const TOP_BLOCK_HEIGHT: f32 = SOURCE_DIR_ROW_HEIGHT
+    + PROJECT_INFO_ROW_GAP
+    + FILE_TYPES_ROW_HEIGHT
+    + PROJECT_INFO_ROW_GAP
+    + EVENT_THRESHOLDS_ROW_HEIGHT
+    + PROJECT_INFO_ROW_GAP
+    + EVENT_THRESHOLDS_ROW_HEIGHT;
 
 /// Sizes for the Scan Directory area, pinned to the bottom-right of Project Information.
 const SCAN_BUTTON_WIDTH: f32 = 160.0;
@@ -83,6 +90,19 @@ const METADATA_BUTTON_WIDTH: f32 = SCAN_BUTTON_WIDTH;
 const EVENTS_BUTTON_WIDTH: f32 = SCAN_BUTTON_WIDTH;
 /// Horizontal gap between the Scan Directory, Generate MetaData, and Generate Events columns.
 const SCAN_AREA_COLUMN_GAP: f32 = 12.0;
+
+/// Sizes for an event tab's Title row (label, input, and the Prev/Next buttons pinned to
+/// its right edge via a flex-growing spacer label — see `App::build_event_tab_entry`).
+const EVENT_TAB_TITLE_ROW_HEIGHT: f32 = 28.0;
+const EVENT_TAB_TITLE_LABEL_WIDTH: f32 = 40.0;
+const EVENT_TAB_TITLE_INPUT_WIDTH: f32 = 300.0;
+const EVENT_TAB_NAV_BUTTON_WIDTH: f32 = 60.0;
+/// Height of the "Notes" label directly below the Title row.
+const EVENT_TAB_NOTES_LABEL_HEIGHT: f32 = 18.0;
+/// Height of the multi-line Notes box directly below its label.
+const EVENT_TAB_NOTES_INPUT_HEIGHT: f32 = 80.0;
+/// Vertical gap between the Title row, Notes label, Notes box, and the photo table below.
+const EVENT_TAB_ROW_GAP: f32 = 6.0;
 
 /// Whether the given virtual key (e.g. `VK_CONTROL`) is currently held down.
 fn key_down(vk: winapi::ctypes::c_int) -> bool {
@@ -157,18 +177,45 @@ fn tab_strip_hit_test_at_cursor(container: &nwg::TabsContainer) -> Option<usize>
     }
 }
 
-/// One open Context Window "Image List" tab.
+/// The controls specific to one flavor of Context Window tab; `key`/`tab`/`layout` on
+/// `ContextTabEntry` are common to both and drive the shared open/switch/close/visibility
+/// machinery regardless of which kind a tab is.
+enum ContextTabKind {
+    /// A directory or File Type's photo table (`App::build_context_tab_entry`).
+    ImageList {
+        /// Never read after `build_context_tab_entry` populates it, but must be kept
+        /// alive: dropping it would run `nwg::ListView`'s `Drop` impl and destroy the
+        /// table's HWND out from under the still-visible tab.
+        #[allow(dead_code)]
+        list_view: nwg::ListView,
+    },
+    /// One event's title input, notes box, and photo table (`App::build_event_tab_entry`).
+    Event {
+        event_id: i64,
+        #[allow(dead_code)]
+        title_input: nwg::TextInput,
+        #[allow(dead_code)]
+        notes_input: nwg::TextBox,
+        #[allow(dead_code)]
+        prev_button: nwg::Button,
+        #[allow(dead_code)]
+        next_button: nwg::Button,
+        #[allow(dead_code)]
+        list_view: nwg::ListView,
+    },
+}
+
+/// One open Context Window tab (an "Image List" table or an event).
 struct ContextTabEntry {
-    /// Also the tab's display title (`nav_tree`'s dir or "dir/type" name) — doubles as
-    /// the switch-vs-create lookup key.
+    /// Also the tab's display title — doubles as the switch-vs-create lookup key. An
+    /// Image List tab's is `context_tabs::tab_title`'s dir/type name; an event tab's is
+    /// the stable `context_tabs::event_tab_title` (never the event's editable title,
+    /// which that function's doc comment explains).
     key: String,
     tab: nwg::Tab,
-    /// Never read after `build_context_tab_entry` populates it, but must be kept alive:
-    /// dropping it would run `nwg::ListView`'s `Drop` impl and destroy the table's HWND
-    /// out from under the still-visible tab.
-    #[allow(dead_code)]
-    list_view: nwg::ListView,
-    /// Same reasoning as `list_view` — kept alive so its layout keeps applying.
+    kind: ContextTabKind,
+    /// Never read after being populated, but must be kept alive: dropping it would run
+    /// `nwg::FlexboxLayout`'s `Drop` impl and stop the tab's content from being laid out.
     #[allow(dead_code)]
     layout: nwg::FlexboxLayout,
 }
@@ -207,6 +254,15 @@ pub struct App {
     /// silently stop working. Each new tab gets its own hook bound the same way, kept
     /// alive here for the app's lifetime.
     context_tab_event_handlers: RefCell<Vec<nwg::EventHandler>>,
+    /// Every generated event's id, per type, in the same order as `nav_tree`'s Events
+    /// node — `App::navigate_event` (Prev/Next) steps through this rather than
+    /// re-querying the database on every click.
+    event_order: RefCell<HashMap<db::models::EventType, Vec<i64>>>,
+    /// Maps an event id to its `nav_tree` leaf node, rebuilt every `refresh_nav_tree` —
+    /// lets `open_event_tab`/`context_tab_selection_changed` re-select the matching tree
+    /// node whenever the active tab becomes that event (a direct tree click already moves
+    /// Win32's own selection; this covers Prev/Next and tab-strip clicks, which don't).
+    event_tree_items: RefCell<HashMap<i64, nwg::TreeItem>>,
 
     #[nwg_control(title: "PhotoMatic", flags: "MAIN_WINDOW")]
     #[nwg_events(OnWindowClose: [App::exit], OnKeyPress: [App::on_key_press(SELF, EVT_DATA)])]
@@ -336,6 +392,21 @@ pub struct App {
     #[nwg_control(parent: top_block_frame, text: "hr")]
     multi_hour_gap_unit_label: nwg::Label,
 
+    #[nwg_control(parent: top_block_frame, text: "Event Distance:")]
+    event_distances_label: nwg::Label,
+
+    #[nwg_control(parent: top_block_frame, text: "2")]
+    session_distance_input: nwg::TextInput,
+
+    #[nwg_control(parent: top_block_frame, text: "km")]
+    session_distance_unit_label: nwg::Label,
+
+    #[nwg_control(parent: top_block_frame, text: "50")]
+    multi_hour_distance_input: nwg::TextInput,
+
+    #[nwg_control(parent: top_block_frame, text: "km")]
+    multi_hour_distance_unit_label: nwg::Label,
+
     #[nwg_control(parent: scan_area_frame, flags: "MARQUEE", marquee: true, marquee_update: 30)]
     scan_progress: nwg::ProgressBar,
 
@@ -355,7 +426,10 @@ pub struct App {
     events_button: nwg::Button,
 
     #[nwg_control(parent: nav_frame, flags: "VISIBLE")]
-    #[nwg_events(OnTreeViewRightClick: [App::nav_tree_right_click])]
+    #[nwg_events(
+        OnTreeViewRightClick: [App::nav_tree_right_click],
+        OnTreeViewClick: [App::nav_tree_click(RC_SELF)],
+    )]
     nav_tree: nwg::TreeView,
 
     #[nwg_control(parent: window, popup: true)]
@@ -373,6 +447,7 @@ pub struct App {
     #[nwg_events(
         TabsContainerChanged: [App::context_tab_selection_changed],
         OnMousePress: [App::context_tabs_mouse_press(SELF, EVT)],
+        OnKeyPress: [App::on_key_press(SELF, EVT_DATA)],
     )]
     context_tabs_container: nwg::TabsContainer,
 
@@ -390,6 +465,7 @@ pub struct App {
     source_dir_layout: nwg::FlexboxLayout,
     file_types_layout: nwg::FlexboxLayout,
     event_thresholds_layout: nwg::FlexboxLayout,
+    event_distances_layout: nwg::FlexboxLayout,
     scan_area_layout: nwg::FlexboxLayout,
     scan_column_layout: nwg::FlexboxLayout,
     metadata_column_layout: nwg::FlexboxLayout,
@@ -517,6 +593,26 @@ impl App {
             .build_partial(&self.event_thresholds_layout)
             .expect("Failed to build the Event Gaps row layout");
 
+        nwg::FlexboxLayout::builder()
+            .parent(&self.top_block_frame)
+            .flex_direction(FlexDirection::Row)
+            .justify_content(JustifyContent::FlexStart)
+            .align_items(AlignItems::FlexStart)
+            .child(&self.event_distances_label)
+            .child_size(Size { width: D::Points(PROJECT_INFO_LABEL_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .child_margin(row_margin)
+            .child(&self.session_distance_input)
+            .child_size(Size { width: D::Points(EVENT_THRESHOLD_INPUT_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .child(&self.session_distance_unit_label)
+            .child_size(Size { width: D::Points(EVENT_THRESHOLD_UNIT_LABEL_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .child_margin(row_margin)
+            .child(&self.multi_hour_distance_input)
+            .child_size(Size { width: D::Points(EVENT_THRESHOLD_INPUT_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .child(&self.multi_hour_distance_unit_label)
+            .child_size(Size { width: D::Points(EVENT_THRESHOLD_UNIT_LABEL_WIDTH), height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .build_partial(&self.event_distances_layout)
+            .expect("Failed to build the Event Distance row layout");
+
         // Progress bar above each button, both columns pinned to the bottom-right corner
         // of Project Information via `justify_content`/`align_items: FlexEnd`.
         let scan_area_margin = Rect { start: D::Points(0.0), end: D::Points(0.0), top: D::Points(0.0), bottom: D::Points(SCAN_AREA_GAP) };
@@ -599,6 +695,9 @@ impl App {
             .child_size(Size { width: D::Auto, height: D::Points(FILE_TYPES_ROW_HEIGHT) })
             .child_margin(rows_margin)
             .child_layout(&self.event_thresholds_layout)
+            .child_size(Size { width: D::Auto, height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
+            .child_margin(rows_margin)
+            .child_layout(&self.event_distances_layout)
             .child_size(Size { width: D::Auto, height: D::Points(EVENT_THRESHOLDS_ROW_HEIGHT) })
             .build(&self.top_block_layout)
             .expect("Failed to build the Project Information top block layout");
@@ -779,6 +878,30 @@ impl App {
             // that's the whole point of putting them in the tree.
             self.nav_tree.set_expand_state(&dir_item, nwg::ExpandState::Expand);
         }
+
+        // `TreeInsert::Last` (not `Sort`, unlike the directories above) so this always ends
+        // up after every directory node regardless of directory names — always present, even
+        // before Generate Events has ever run, in which case it simply gets no children.
+        self.event_tree_items.borrow_mut().clear();
+        self.event_order.borrow_mut().clear();
+        let events_root = self.nav_tree.insert_item("Events", None, nwg::TreeInsert::Last);
+        for type_node in event_tree::build(&db.list_events().unwrap_or_default()) {
+            let type_item = self.nav_tree.insert_item(&type_node.label, Some(&events_root), nwg::TreeInsert::Last);
+            let mut ids = Vec::with_capacity(type_node.events.len());
+            for leaf in &type_node.events {
+                // The event id rides on the node as its `lParam` (`item_param` reads it
+                // back in `nav_tree_click`) instead of being parsed out of the label the
+                // way File Type nodes' extension is — the label here is the event's own
+                // editable title, not a fixed, parseable format.
+                let item = self.nav_tree.insert_item_with_param(&leaf.title, Some(&type_item), nwg::TreeInsert::Last, leaf.id as isize);
+                self.event_tree_items.borrow_mut().insert(leaf.id, item);
+                ids.push(leaf.id);
+            }
+            self.event_order.borrow_mut().insert(type_node.event_type, ids);
+        }
+        // The root is expanded so its type nodes are visible without an extra click; a type
+        // node itself starts collapsed (unlike a directory node) since it can hold many events.
+        self.nav_tree.set_expand_state(&events_root, nwg::ExpandState::Expand);
     }
 
     /// Fired via `OnTreeViewRightClick`. `nwg::TreeView` doesn't change selection on a
@@ -805,6 +928,19 @@ impl App {
         *self.nav_tree_context_type.borrow_mut() = image_type;
         let (x, y) = nwg::GlobalCursor::position();
         self.nav_tree_menu.popup(x, y);
+    }
+
+    /// Fired via `OnTreeViewClick`. Unlike a right click, a genuine left click already
+    /// moves Win32's own tree selection, so this just reads it back via `selected_item`
+    /// rather than hit-testing. Only an event leaf node carries a positive `lParam` (set
+    /// by `refresh_nav_tree` via `insert_item_with_param`) — directory/File Type/event-type
+    /// nodes were inserted without one, which reads back as `0` — so clicking anything
+    /// other than an event just expands/collapses it natively, with no extra handling
+    /// needed here. Takes `&Rc<App>` (via `RC_SELF`) because opening a tab needs one.
+    fn nav_tree_click(app: &Rc<App>) {
+        let Some(item) = app.nav_tree.selected_item() else { return };
+        let Some(event_id) = app.nav_tree.item_param(&item).filter(|&param| param > 0) else { return };
+        Self::open_event_tab(app, event_id as i64);
     }
 
     /// The `nav_tree_menu`'s "Open in Explorer" item: opens Windows Explorer at the
@@ -917,7 +1053,252 @@ impl App {
         });
         app.context_tab_event_handlers.borrow_mut().push(handler);
 
-        ContextTabEntry { key: title.to_string(), tab, list_view, layout }
+        ContextTabEntry { key: title.to_string(), tab, kind: ContextTabKind::ImageList { list_view }, layout }
+    }
+
+    /// The Events tree node's leaf click (`nav_tree_click`) and an event tab's Prev/Next
+    /// buttons both funnel through here: opens (or switches to) the Context Window tab for
+    /// `event_id`, and — either way — re-selects that event's `nav_tree` node, which is
+    /// what keeps the tree showing the currently displayed event true for Prev/Next and
+    /// tab-strip clicks (a direct tree click already moves the selection itself). Silently
+    /// does nothing if `event_id` no longer exists (e.g. a stale Prev/Next target after a
+    /// "Generate Events" rebuild changed the id space).
+    fn open_event_tab(app: &Rc<App>, event_id: i64) {
+        let key = context_tabs::event_tab_title(event_id);
+
+        if let Some(index) = app.context_tabs.borrow().iter().position(|t| t.key == key) {
+            app.context_tabs_container.set_selected_tab(index);
+            app.sync_context_tab_visibility(&app.context_tabs.borrow());
+            app.select_event_tree_node(event_id);
+            app.focus_event_tab_title(event_id);
+            return;
+        }
+
+        let (event, images) = {
+            let db = app.db.borrow();
+            let Some(db) = db.as_ref() else { return };
+            let Some(event) = db.get_event(event_id).ok().flatten() else { return };
+            (event, db.event_images(event_id).unwrap_or_default())
+        };
+
+        let mut tabs = app.context_tabs.borrow_mut();
+        tabs.push(Self::build_event_tab_entry(app, &event, &images));
+        let new_index = tabs.len() - 1;
+        app.context_tabs_container.set_selected_tab(new_index);
+        app.sync_context_tab_visibility(&tabs);
+        drop(tabs);
+        app.select_event_tree_node(event_id);
+        app.focus_event_tab_title(event_id);
+    }
+
+    /// Selects `event_id`'s leaf node in `nav_tree`, if it's currently in the tree
+    /// (`refresh_nav_tree` populates `event_tree_items`; a stale id after a rebuild is a
+    /// harmless no-op).
+    fn select_event_tree_node(&self, event_id: i64) {
+        if let Some(item) = self.event_tree_items.borrow().get(&event_id) {
+            self.nav_tree.select_item(item);
+        }
+    }
+
+    /// Builds one event tab: a Title row (label, input, and Prev/Next pinned to the right
+    /// via a flex-growing spacer label), a Notes label and multi-line box below it, and a
+    /// photo table filling the rest — construction of that table mirrors
+    /// `build_context_tab_entry`'s (same `context_tabs::COLUMNS`/`image_row`). The tab
+    /// header text is fixed at `context_tabs::event_tab_title` for the reason that
+    /// function's doc comment gives (never renamed to the live title).
+    ///
+    /// Needs `&Rc<App>` for the same two reasons `build_context_tab_entry` does: rebinding
+    /// keyboard shortcuts, and (new here) dispatching the Prev/Next buttons' and the
+    /// title/notes inputs' events, all through one `full_bind_event_handler` closure.
+    fn build_event_tab_entry(app: &Rc<App>, event: &db::models::EventRecord, images: &[db::models::ImageRecord]) -> ContextTabEntry {
+        let title = context_tabs::event_tab_title(event.id);
+        let mut tab = nwg::Tab::default();
+        nwg::Tab::builder().parent(&app.context_tabs_container).text(&title).build(&mut tab).expect("Failed to build event tab");
+
+        let mut title_label = nwg::Label::default();
+        nwg::Label::builder().parent(&tab).text("Title:").build(&mut title_label).expect("Failed to build the event Title label");
+
+        let mut title_input = nwg::TextInput::default();
+        nwg::TextInput::builder()
+            .parent(&tab)
+            .text(&event.title)
+            .build(&mut title_input)
+            .expect("Failed to build the event Title input");
+
+        // Eats all remaining Title-row width so Prev/Next land flush against the right edge —
+        // `build_layout`'s doc comment notes `justify_content: SpaceBetween` isn't reliable
+        // across nested `child_layout`s, so a flex-growing empty label is used instead.
+        let mut title_spacer = nwg::Label::default();
+        nwg::Label::builder().parent(&tab).text("").build(&mut title_spacer).expect("Failed to build the event Title row spacer");
+
+        let mut prev_button = nwg::Button::default();
+        nwg::Button::builder().parent(&tab).text("&Prev").build(&mut prev_button).expect("Failed to build the event Prev button");
+
+        let mut next_button = nwg::Button::default();
+        nwg::Button::builder().parent(&tab).text("Ne&xt").build(&mut next_button).expect("Failed to build the event Next button");
+
+        let mut notes_label = nwg::Label::default();
+        nwg::Label::builder().parent(&tab).text("Notes").build(&mut notes_label).expect("Failed to build the event Notes label");
+
+        let mut notes_input = nwg::TextBox::default();
+        nwg::TextBox::builder()
+            .parent(&tab)
+            .text(&event.notes)
+            .flags(nwg::TextBoxFlags::VISIBLE | nwg::TextBoxFlags::VSCROLL | nwg::TextBoxFlags::AUTOVSCROLL)
+            .build(&mut notes_input)
+            .expect("Failed to build the event Notes box");
+
+        let mut list_view = nwg::ListView::default();
+        nwg::ListView::builder()
+            .parent(&tab)
+            .list_style(nwg::ListViewStyle::Detailed)
+            .flags(nwg::ListViewFlags::VISIBLE | nwg::ListViewFlags::TAB_STOP)
+            .ex_flags(nwg::ListViewExFlags::FULL_ROW_SELECT | nwg::ListViewExFlags::GRID)
+            .build(&mut list_view)
+            .expect("Failed to build the event's photo table");
+        for (index, (column_title, width)) in context_tabs::COLUMNS.iter().enumerate() {
+            list_view.insert_column(nwg::InsertListViewColumn {
+                index: Some(index as i32),
+                text: Some((*column_title).to_string()),
+                width: Some(*width),
+                ..Default::default()
+            });
+        }
+        list_view.set_headers_enabled(true);
+        for record in images {
+            let items: Vec<nwg::InsertListViewItem> = context_tabs::image_row(record)
+                .into_iter()
+                .map(|text| nwg::InsertListViewItem { text: Some(text), ..Default::default() })
+                .collect();
+            list_view.insert_items_row(None, &items);
+        }
+
+        let title_row_layout = nwg::FlexboxLayout::default();
+        nwg::FlexboxLayout::builder()
+            .parent(&tab)
+            .flex_direction(FlexDirection::Row)
+            .align_items(AlignItems::Center)
+            .child(&title_label)
+            .child_size(Size { width: D::Points(EVENT_TAB_TITLE_LABEL_WIDTH), height: D::Points(EVENT_TAB_TITLE_ROW_HEIGHT) })
+            .child(&title_input)
+            .child_size(Size { width: D::Points(EVENT_TAB_TITLE_INPUT_WIDTH), height: D::Points(EVENT_TAB_TITLE_ROW_HEIGHT) })
+            .child(&title_spacer)
+            .child_size(Size { width: D::Auto, height: D::Points(EVENT_TAB_TITLE_ROW_HEIGHT) })
+            .child_flex_grow(1.0)
+            .child(&prev_button)
+            .child_size(Size { width: D::Points(EVENT_TAB_NAV_BUTTON_WIDTH), height: D::Points(EVENT_TAB_TITLE_ROW_HEIGHT) })
+            .child(&next_button)
+            .child_size(Size { width: D::Points(EVENT_TAB_NAV_BUTTON_WIDTH), height: D::Points(EVENT_TAB_TITLE_ROW_HEIGHT) })
+            .build_partial(&title_row_layout)
+            .expect("Failed to build the event tab's Title row layout");
+
+        let rows_margin =
+            Rect { start: D::Points(0.0), end: D::Points(0.0), top: D::Points(0.0), bottom: D::Points(EVENT_TAB_ROW_GAP) };
+        let mut layout = nwg::FlexboxLayout::default();
+        nwg::FlexboxLayout::builder()
+            .parent(&tab)
+            .flex_direction(FlexDirection::Column)
+            .child_layout(&title_row_layout)
+            .child_size(Size { width: D::Percent(1.0), height: D::Points(EVENT_TAB_TITLE_ROW_HEIGHT) })
+            .child_margin(rows_margin)
+            .child(&notes_label)
+            .child_size(Size { width: D::Percent(1.0), height: D::Points(EVENT_TAB_NOTES_LABEL_HEIGHT) })
+            .child(&notes_input)
+            .child_size(Size { width: D::Percent(1.0), height: D::Points(EVENT_TAB_NOTES_INPUT_HEIGHT) })
+            .child_margin(rows_margin)
+            .child(&list_view)
+            .child_size(Size { width: D::Percent(1.0), height: D::Auto })
+            .child_flex_grow(1.0)
+            .build(&mut layout)
+            .expect("Failed to build the event tab's layout");
+
+        // Recursively subclasses `tab` and everything under it — same reason
+        // `build_context_tab_entry` needs this for keyboard shortcuts, extended here to also
+        // dispatch the Prev/Next buttons and the title/notes inputs. All three are matched by
+        // comparing the firing control's `handle` against this tab's own controls, looked up
+        // through `app.context_tabs` at fire time rather than captured by value — `TextInput`/
+        // `TextBox`/`Button` aren't `Clone`, and by the time this closure runs, this very
+        // `ContextTabEntry` (which owns them) has been moved into that `Vec`.
+        let app_weak = Rc::downgrade(app);
+        let event_id = event.id;
+        let event_type = event.event_type;
+        let prev_handle = prev_button.handle;
+        let next_handle = next_button.handle;
+        let title_handle = title_input.handle;
+        let notes_handle = notes_input.handle;
+        let handler = nwg::full_bind_event_handler(&tab.handle, move |evt, evt_data, handle| {
+            let Some(app) = app_weak.upgrade() else { return };
+            match evt {
+                nwg::Event::OnKeyPress => app.on_key_press(&evt_data),
+                nwg::Event::OnButtonClick if handle == prev_handle => App::navigate_event(&app, event_id, event_type, -1),
+                nwg::Event::OnButtonClick if handle == next_handle => App::navigate_event(&app, event_id, event_type, 1),
+                nwg::Event::OnTextInput if handle == title_handle || handle == notes_handle => {
+                    app.persist_event_tab_text(event_id)
+                }
+                _ => {}
+            }
+        });
+        app.context_tab_event_handlers.borrow_mut().push(handler);
+
+        ContextTabEntry {
+            key: title,
+            tab,
+            kind: ContextTabKind::Event { event_id: event.id, title_input, notes_input, prev_button, next_button, list_view },
+            layout,
+        }
+    }
+
+    /// A Prev/Next button's click: steps to the sibling event of `event_id` within its own
+    /// `event_type` in `event_order` (looping past either end), and opens (or switches to)
+    /// its tab. A type with only one event loops back to itself.
+    fn navigate_event(app: &Rc<App>, event_id: i64, event_type: db::models::EventType, direction: i32) {
+        let order = app.event_order.borrow();
+        let Some(siblings) = order.get(&event_type) else { return };
+        let Some(position) = siblings.iter().position(|&id| id == event_id) else { return };
+        let next_position = (position as i32 + direction).rem_euclid(siblings.len() as i32) as usize;
+        let target = siblings[next_position];
+        drop(order);
+        Self::open_event_tab(app, target);
+    }
+
+    /// An event tab's title input or notes box firing `OnTextInput`: reads both controls'
+    /// current text, writes it straight to the database (title/notes have no separate Save
+    /// control — see `db::events::update_event`'s doc comment), and keeps the tree node's
+    /// label live so an edited title shows up in `nav_tree` immediately.
+    fn persist_event_tab_text(&self, event_id: i64) {
+        let tabs = self.context_tabs.borrow();
+        let Some(ContextTabKind::Event { title_input, notes_input, .. }) =
+            tabs.iter().find(|t| matches!(&t.kind, ContextTabKind::Event { event_id: id, .. } if *id == event_id)).map(|t| &t.kind)
+        else {
+            return;
+        };
+        let title = title_input.text();
+        let notes = notes_input.text();
+        drop(tabs);
+
+        if let Some(db) = self.db.borrow().as_ref() {
+            let _ = db.update_event(event_id, &title, &notes);
+        }
+        if let Some(item) = self.event_tree_items.borrow().get(&event_id) {
+            self.nav_tree.set_item_text(item, &title);
+        }
+    }
+
+    /// Focuses `event_id`'s Title input and selects its full text, so every path that
+    /// makes an event tab the active one (`open_event_tab`, and a direct tab-strip click
+    /// via `context_tab_selection_changed`) leaves the Title field ready to type over
+    /// immediately, without an extra click.
+    fn focus_event_tab_title(&self, event_id: i64) {
+        let tabs = self.context_tabs.borrow();
+        let Some(ContextTabKind::Event { title_input, .. }) = tabs
+            .iter()
+            .find(|t| matches!(&t.kind, ContextTabKind::Event { event_id: id, .. } if *id == event_id))
+            .map(|t| &t.kind)
+        else {
+            return;
+        };
+        title_input.set_focus();
+        title_input.set_selection(0..title_input.len());
     }
 
     /// Corrects `context_tabs_container`'s per-tab visibility ourselves: the underlying
@@ -935,9 +1316,20 @@ impl App {
     /// Fired via `TabsContainerChanged` — i.e. only for a genuine user click on the tab
     /// strip (programmatic `set_selected_tab` calls do NOT raise this event, which is why
     /// every code path that calls `set_selected_tab` also calls
-    /// `sync_context_tab_visibility` directly).
+    /// `sync_context_tab_visibility` directly). Also re-selects `nav_tree`'s matching node
+    /// when the newly active tab is an event — `open_event_tab` already does this for its
+    /// own tab-selecting code paths, but a tab-strip click bypasses it entirely.
     fn context_tab_selection_changed(&self) {
-        self.sync_context_tab_visibility(&self.context_tabs.borrow());
+        let tabs = self.context_tabs.borrow();
+        self.sync_context_tab_visibility(&tabs);
+        if let Some(ContextTabEntry { kind: ContextTabKind::Event { event_id, .. }, .. }) =
+            tabs.get(self.context_tabs_container.selected_tab())
+        {
+            let event_id = *event_id;
+            drop(tabs);
+            self.select_event_tree_node(event_id);
+            self.focus_event_tab_title(event_id);
+        }
     }
 
     /// Closes the Context Window tab currently active (Ctrl+W's target — there's no
@@ -1181,15 +1573,23 @@ impl App {
         if let Ok(value) = self.multi_hour_gap_input.text().trim().parse() {
             thresholds.multi_hour_gap_hours = value;
         }
+        if let Ok(value) = self.session_distance_input.text().trim().parse() {
+            thresholds.session_max_distance_km = value;
+        }
+        if let Ok(value) = self.multi_hour_distance_input.text().trim().parse() {
+            thresholds.multi_hour_max_distance_km = value;
+        }
         self.project.borrow_mut().event_thresholds = thresholds;
     }
 
-    /// Sets the Event Gaps inputs to reflect `thresholds` — used when starting a new project
-    /// or loading one, the reverse direction of `sync_event_thresholds_from_inputs`.
+    /// Sets the Event Gaps/Event Distance inputs to reflect `thresholds` — used when starting a
+    /// new project or loading one, the reverse direction of `sync_event_thresholds_from_inputs`.
     fn set_event_threshold_inputs(&self, thresholds: &EventThresholds) {
         self.burst_gap_input.set_text(&thresholds.burst_gap_seconds.to_string());
         self.session_gap_input.set_text(&thresholds.session_gap_minutes.to_string());
         self.multi_hour_gap_input.set_text(&thresholds.multi_hour_gap_hours.to_string());
+        self.session_distance_input.set_text(&thresholds.session_max_distance_km.to_string());
+        self.multi_hour_distance_input.set_text(&thresholds.multi_hour_max_distance_km.to_string());
     }
 
     /// Directory of the most recently loaded/saved project, if that directory
@@ -1350,20 +1750,47 @@ impl App {
     fn start_generate_events(&self) {
         self.sync_event_thresholds_from_inputs();
 
-        let mut db = self.db.borrow_mut();
-        let Some(db) = db.as_mut() else { return };
+        {
+            let mut db = self.db.borrow_mut();
+            let Some(db) = db.as_mut() else { return };
 
-        let images = db.list_images().unwrap_or_default();
-        let thresholds = self.project.borrow().event_thresholds.clone();
-        let db_thresholds = db::EventThresholds {
-            burst: chrono::Duration::seconds(thresholds.burst_gap_seconds as i64),
-            session: chrono::Duration::minutes(thresholds.session_gap_minutes as i64),
-            multi_hour: chrono::Duration::hours(thresholds.multi_hour_gap_hours as i64),
-        };
+            // Regenerating unconditionally deletes and rebuilds every event (see
+            // `db::events::regenerate`'s doc comment), which would silently erase any
+            // title/notes edit already made — ask first whenever one exists.
+            if db.has_edited_events().unwrap_or(false) {
+                let choice = nwg::modal_message(
+                    &self.window,
+                    &nwg::MessageParams {
+                        title: "PhotoMatic",
+                        content: "Regenerating events will erase any titles and notes you've entered. Continue?",
+                        buttons: nwg::MessageButtons::YesNo,
+                        icons: nwg::MessageIcons::Warning,
+                    },
+                );
+                if choice != nwg::MessageChoice::Yes {
+                    return;
+                }
+            }
 
-        if let Err(err) = db.regenerate_events(&images, &db_thresholds) {
-            nwg::simple_message("PhotoMatic", &format!("Failed to generate events: {err}"));
+            let images = db.list_images().unwrap_or_default();
+            let thresholds = self.project.borrow().event_thresholds.clone();
+            let db_thresholds = db::EventThresholds {
+                burst: chrono::Duration::seconds(thresholds.burst_gap_seconds as i64),
+                session: chrono::Duration::minutes(thresholds.session_gap_minutes as i64),
+                multi_hour: chrono::Duration::hours(thresholds.multi_hour_gap_hours as i64),
+                session_max_distance_km: thresholds.session_max_distance_km,
+                multi_hour_max_distance_km: thresholds.multi_hour_max_distance_km,
+            };
+
+            if let Err(err) = db.regenerate_events(&images, &db_thresholds) {
+                nwg::simple_message("PhotoMatic", &format!("Failed to generate events: {err}"));
+            }
         }
+
+        // Regenerate wrote new `events`/`event_images` rows directly to the database, so
+        // `nav_tree`'s Events node (and `event_order`/`event_tree_items`) needs rebuilding
+        // to reflect them — nothing else does this automatically after Generate Events.
+        self.refresh_nav_tree();
     }
 
     /// Extracts EXIF metadata for every image that doesn't have it yet, on a small
@@ -1457,8 +1884,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_info_height_is_182_points() {
-        assert_eq!(PROJECT_INFO_HEIGHT, 182.0);
+    fn project_info_height_is_218_points() {
+        assert_eq!(PROJECT_INFO_HEIGHT, 218.0);
     }
 
     #[test]

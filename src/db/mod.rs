@@ -153,6 +153,33 @@ impl ProjectDb {
     pub fn regenerate_events(&mut self, images: &[models::ImageRecord], thresholds: &EventThresholds) -> Result<(), DbError> {
         events::regenerate(&mut self.conn, images, thresholds)
     }
+
+    /// Every generated event with its photo count, chronologically ordered — backs the
+    /// Left Navigation tree's Events node.
+    pub fn list_events(&self) -> Result<Vec<models::EventSummary>, DbError> {
+        events::list_events(&self.conn)
+    }
+
+    /// The photos belonging to one event, chronologically ordered — an event tab's photo table.
+    pub fn event_images(&self, event_id: i64) -> Result<Vec<models::ImageRecord>, DbError> {
+        events::event_images(&self.conn, event_id)
+    }
+
+    /// One event's id/type/title/notes, for populating a newly opened event tab.
+    pub fn get_event(&self, event_id: i64) -> Result<Option<models::EventRecord>, DbError> {
+        events::get_event(&self.conn, event_id)
+    }
+
+    /// Writes a user-edited title/notes back to one event.
+    pub fn update_event(&self, event_id: i64, title: &str, notes: &str) -> Result<(), DbError> {
+        events::update_event(&self.conn, event_id, title, notes)
+    }
+
+    /// Whether any event currently holds a user-entered title or notes — backs the warning
+    /// Generate Events shows before a rebuild would silently erase them.
+    pub fn has_edited_events(&self) -> Result<bool, DbError> {
+        events::has_edited_events(&self.conn)
+    }
 }
 
 /// Normalizes a relative path to forward-slash (POSIX) separators, regardless of the
@@ -223,7 +250,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 6);
+        assert_eq!(db.schema_version().unwrap(), 7);
 
         std::fs::remove_file(&path).ok();
     }

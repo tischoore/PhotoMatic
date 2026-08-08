@@ -45,7 +45,7 @@ pub struct DirectoryRecord {
 }
 
 /// The clustering granularity an `events` row was generated at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventType {
     TightBurst,
     Session,
@@ -84,15 +84,25 @@ impl std::str::FromStr for EventType {
     }
 }
 
-/// A row in the `events` table. No query returns this yet — reserved for the events-browsing
-/// UI that will follow the "Generate Events" button, the same way `DirectoryRecord`'s
-/// `author`/`camera_type` were added ahead of their editing UI.
+/// A row in the `events` table, as loaded for the events-browsing UI (an event tab's
+/// title input, notes box, and photo table).
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub struct EventRecord {
     pub id: i64,
     pub event_type: EventType,
+    pub title: String,
     pub notes: String,
+}
+
+/// One `events` row plus its photo count, as listed for the Left Navigation tree's
+/// Events node — grouping into per-type tree nodes happens in `crate::event_tree`,
+/// not here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventSummary {
+    pub id: i64,
+    pub event_type: EventType,
+    pub title: String,
+    pub image_count: i64,
 }
 
 #[cfg(test)]
