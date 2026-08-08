@@ -50,7 +50,8 @@ pub fn image_row(record: &ImageRecord) -> [String; 9] {
 /// Sub-second exposures render as a fraction (e.g. `1/125s`, matching how shutter speeds
 /// are conventionally shown); one-second-or-longer exposures render as decimal seconds
 /// (e.g. `2.0s`). `None` or a non-positive value (defensive, shouldn't occur) is blank.
-fn format_exposure_time(seconds: Option<f64>) -> String {
+/// `pub(crate)` so `image_viewer`'s metadata dialog can format the same field identically.
+pub(crate) fn format_exposure_time(seconds: Option<f64>) -> String {
     match seconds {
         Some(s) if s > 0.0 && s < 1.0 => format!("1/{}s", (1.0 / s).round() as i64),
         Some(s) if s > 0.0 => format!("{s:.1}s"),
@@ -60,14 +61,14 @@ fn format_exposure_time(seconds: Option<f64>) -> String {
 
 /// `"{lat}, {lon}"` to 5 decimal places (~1.1m precision) when both are present; blank
 /// otherwise — a coordinate needs both halves to mean anything.
-fn format_gps_coordinates(lat: Option<f64>, lon: Option<f64>) -> String {
+pub(crate) fn format_gps_coordinates(lat: Option<f64>, lon: Option<f64>) -> String {
     match (lat, lon) {
         (Some(lat), Some(lon)) => format!("{lat:.5}, {lon:.5}"),
         _ => String::new(),
     }
 }
 
-fn format_gps_altitude(meters: Option<f64>) -> String {
+pub(crate) fn format_gps_altitude(meters: Option<f64>) -> String {
     meters.map(|m| format!("{m:.0}m")).unwrap_or_default()
 }
 

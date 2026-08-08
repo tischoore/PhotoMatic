@@ -15,6 +15,8 @@ use crate::db;
 use crate::event_tree;
 use crate::exif;
 use crate::explorer;
+use crate::image_viewer;
+use crate::keyboard;
 use crate::nav_tree;
 use crate::panel_background;
 use crate::project::{self, EventThresholds, FileExtensions, ProjectFile};
@@ -91,12 +93,13 @@ const EVENTS_BUTTON_WIDTH: f32 = SCAN_BUTTON_WIDTH;
 /// Horizontal gap between the Scan Directory, Generate MetaData, and Generate Events columns.
 const SCAN_AREA_COLUMN_GAP: f32 = 12.0;
 
-/// Sizes for an event tab's Title row (label, input, and the Prev/Next buttons pinned to
-/// its right edge via a flex-growing spacer label — see `App::build_event_tab_entry`).
+/// Sizes for an event tab's Title row (label, input, and the View Images/Prev/Next buttons
+/// pinned to its right edge via a flex-growing spacer label — see `App::build_event_tab_entry`).
 const EVENT_TAB_TITLE_ROW_HEIGHT: f32 = 28.0;
 const EVENT_TAB_TITLE_LABEL_WIDTH: f32 = 40.0;
 const EVENT_TAB_TITLE_INPUT_WIDTH: f32 = 300.0;
 const EVENT_TAB_NAV_BUTTON_WIDTH: f32 = 60.0;
+const EVENT_TAB_VIEW_IMAGES_BUTTON_WIDTH: f32 = 100.0;
 /// Height of the "Notes" label directly below the Title row.
 const EVENT_TAB_NOTES_LABEL_HEIGHT: f32 = 18.0;
 /// Height of the multi-line Notes box directly below its label.
@@ -104,15 +107,10 @@ const EVENT_TAB_NOTES_INPUT_HEIGHT: f32 = 80.0;
 /// Vertical gap between the Title row, Notes label, Notes box, and the photo table below.
 const EVENT_TAB_ROW_GAP: f32 = 6.0;
 
-/// Whether the given virtual key (e.g. `VK_CONTROL`) is currently held down.
-fn key_down(vk: winapi::ctypes::c_int) -> bool {
-    unsafe { winapi::um::winuser::GetKeyState(vk) & 0x8000u16 as i16 != 0 }
-}
-
 /// Finds the tree item under the current cursor position, if any. `nwg::TreeView`
 /// exposes no "item under a point" query of its own, so this sends `TVM_HITTEST`
 /// directly to the control's `HWND` — the same low-level-winapi-call pattern
-/// `key_down` above uses for modifier keys, needed here because right-clicking a
+/// `crate::keyboard::key_down` uses for modifier keys, needed here because right-clicking a
 /// Win32 tree view doesn't move its selection the way a left click does.
 fn tree_hit_test_at_cursor(tree: &nwg::TreeView) -> Option<nwg::TreeItem> {
     use winapi::shared::windef::POINT;
@@ -197,6 +195,8 @@ enum ContextTabKind {
         #[allow(dead_code)]
         notes_input: nwg::TextBox,
         #[allow(dead_code)]
+        view_images_button: nwg::Button,
+        #[allow(dead_code)]
         prev_button: nwg::Button,
         #[allow(dead_code)]
         next_button: nwg::Button,
@@ -237,6 +237,10 @@ pub struct App {
     /// The File Type extension right-clicked (leaf node only; `None` for a directory-node
     /// right-click), stashed alongside `nav_tree_context_dir` for `open_image_list_tab`.
     nav_tree_context_type: RefCell<Option<String>>,
+    /// The event id right-clicked in `nav_tree`'s Events node, remembered between
+    /// `nav_tree_right_click` (which shows `event_context_menu`) and
+    /// `open_event_viewer_from_context_menu`.
+    event_context_id: RefCell<Option<i64>>,
     /// Open Context Window tabs, left-to-right in the same order as
     /// `context_tabs_container`'s native tab strip — always kept contiguous: `close_tab_at`
     /// removes exactly the closed tab's entry, and Win32 itself shifts the remaining
@@ -442,6 +446,13 @@ pub struct App {
     #[nwg_control(parent: nav_tree_menu, text: "&Image List")]
     #[nwg_events(OnMenuItemSelected: [App::open_image_list_tab(RC_SELF)])]
     nav_tree_menu_image_list: nwg::MenuItem,
+
+    #[nwg_control(parent: window, popup: true)]
+    event_context_menu: nwg::Menu,
+
+    #[nwg_control(parent: event_context_menu, text: "&View Images")]
+    #[nwg_events(OnMenuItemSelected: [App::open_event_viewer_from_context_menu])]
+    event_context_menu_view: nwg::MenuItem,
 
     #[nwg_control(parent: context_frame, flags: "VISIBLE")]
     #[nwg_events(
@@ -744,8 +755,8 @@ impl App {
     /// The virtual-key code comes from the event; modifier state isn't part of `OnKeyPress`, so
     /// it's read directly from Win32.
     fn on_key_press(&self, data: &nwg::EventData) {
-        let ctrl = key_down(winapi::um::winuser::VK_CONTROL);
-        let shift = key_down(winapi::um::winuser::VK_SHIFT);
+        let ctrl = keyboard::key_down(winapi::um::winuser::VK_CONTROL);
+        let shift = keyboard::key_down(winapi::um::winuser::VK_SHIFT);
 
         match shortcuts::resolve(data.on_key(), ctrl, shift) {
             Some(ShortcutAction::New) => self.file_new(),
@@ -909,8 +920,20 @@ impl App {
     /// manual `TVM_HITTEST` at the current cursor position. Both top-level directory
     /// nodes and their `jpg (n)`/`cr2 (n)`/`gif (n)` File Type children get the menu —
     /// the directory name and (for a leaf) its extension are stashed for the menu items.
+    ///
+    /// An Events node leaf gets a different, one-item menu instead (View Images) — it carries
+    /// no directory/File Type at all, so treating it through the logic below (which reads the
+    /// *parent*'s text as a directory name) would be meaningless. The same positive-`lParam`
+    /// check `nav_tree_click` uses to recognize an event leaf is used here first.
     fn nav_tree_right_click(&self) {
         let Some(item) = tree_hit_test_at_cursor(&self.nav_tree) else { return };
+
+        if let Some(event_id) = self.nav_tree.item_param(&item).filter(|&param| param > 0) {
+            *self.event_context_id.borrow_mut() = Some(event_id as i64);
+            let (x, y) = nwg::GlobalCursor::position();
+            self.event_context_menu.popup(x, y);
+            return;
+        }
 
         let (dir_name, image_type) = match self.nav_tree.parent(&item) {
             Some(parent) => {
@@ -928,6 +951,14 @@ impl App {
         *self.nav_tree_context_type.borrow_mut() = image_type;
         let (x, y) = nwg::GlobalCursor::position();
         self.nav_tree_menu.popup(x, y);
+    }
+
+    /// The `event_context_menu`'s only item: opens the Image Viewer for the event last
+    /// right-clicked in `nav_tree` (recorded by `nav_tree_right_click`), starting at its
+    /// first photo.
+    fn open_event_viewer_from_context_menu(&self) {
+        let Some(event_id) = self.event_context_id.borrow_mut().take() else { return };
+        self.open_image_viewer(event_id, 0);
     }
 
     /// Fired via `OnTreeViewClick`. Unlike a right click, a genuine left click already
@@ -1131,6 +1162,13 @@ impl App {
         let mut title_spacer = nwg::Label::default();
         nwg::Label::builder().parent(&tab).text("").build(&mut title_spacer).expect("Failed to build the event Title row spacer");
 
+        let mut view_images_button = nwg::Button::default();
+        nwg::Button::builder()
+            .parent(&tab)
+            .text("&View Images")
+            .build(&mut view_images_button)
+            .expect("Failed to build the event View Images button");
+
         let mut prev_button = nwg::Button::default();
         nwg::Button::builder().parent(&tab).text("&Prev").build(&mut prev_button).expect("Failed to build the event Prev button");
 
@@ -1185,6 +1223,8 @@ impl App {
             .child(&title_spacer)
             .child_size(Size { width: D::Auto, height: D::Points(EVENT_TAB_TITLE_ROW_HEIGHT) })
             .child_flex_grow(1.0)
+            .child(&view_images_button)
+            .child_size(Size { width: D::Points(EVENT_TAB_VIEW_IMAGES_BUTTON_WIDTH), height: D::Points(EVENT_TAB_TITLE_ROW_HEIGHT) })
             .child(&prev_button)
             .child_size(Size { width: D::Points(EVENT_TAB_NAV_BUTTON_WIDTH), height: D::Points(EVENT_TAB_TITLE_ROW_HEIGHT) })
             .child(&next_button)
@@ -1214,14 +1254,15 @@ impl App {
 
         // Recursively subclasses `tab` and everything under it — same reason
         // `build_context_tab_entry` needs this for keyboard shortcuts, extended here to also
-        // dispatch the Prev/Next buttons and the title/notes inputs. All three are matched by
-        // comparing the firing control's `handle` against this tab's own controls, looked up
-        // through `app.context_tabs` at fire time rather than captured by value — `TextInput`/
-        // `TextBox`/`Button` aren't `Clone`, and by the time this closure runs, this very
-        // `ContextTabEntry` (which owns them) has been moved into that `Vec`.
+        // dispatch the View Images/Prev/Next buttons and the title/notes inputs. All are
+        // matched by comparing the firing control's `handle` against this tab's own controls,
+        // looked up through `app.context_tabs` at fire time rather than captured by value —
+        // `TextInput`/`TextBox`/`Button` aren't `Clone`, and by the time this closure runs,
+        // this very `ContextTabEntry` (which owns them) has been moved into that `Vec`.
         let app_weak = Rc::downgrade(app);
         let event_id = event.id;
         let event_type = event.event_type;
+        let view_images_handle = view_images_button.handle;
         let prev_handle = prev_button.handle;
         let next_handle = next_button.handle;
         let title_handle = title_input.handle;
@@ -1230,6 +1271,7 @@ impl App {
             let Some(app) = app_weak.upgrade() else { return };
             match evt {
                 nwg::Event::OnKeyPress => app.on_key_press(&evt_data),
+                nwg::Event::OnButtonClick if handle == view_images_handle => app.open_image_viewer(event_id, 0),
                 nwg::Event::OnButtonClick if handle == prev_handle => App::navigate_event(&app, event_id, event_type, -1),
                 nwg::Event::OnButtonClick if handle == next_handle => App::navigate_event(&app, event_id, event_type, 1),
                 nwg::Event::OnTextInput if handle == title_handle || handle == notes_handle => {
@@ -1243,7 +1285,15 @@ impl App {
         ContextTabEntry {
             key: title,
             tab,
-            kind: ContextTabKind::Event { event_id: event.id, title_input, notes_input, prev_button, next_button, list_view },
+            kind: ContextTabKind::Event {
+                event_id: event.id,
+                title_input,
+                notes_input,
+                view_images_button,
+                prev_button,
+                next_button,
+                list_view,
+            },
             layout,
         }
     }
@@ -1259,6 +1309,32 @@ impl App {
         let target = siblings[next_position];
         drop(order);
         Self::open_event_tab(app, target);
+    }
+
+    /// Opens the Image Viewer (`image_viewer::open`, its own thread — see that function's doc
+    /// comment) for `event_id`'s photos, starting at `start_index`. The event tab's View Images
+    /// button and the Left Navigation tree's event context menu both funnel through here. Reuses
+    /// the same `get_event`/`event_images` queries `open_event_tab` uses, so no new database
+    /// query is introduced — `event_images` already orders photos the same way the event tab's
+    /// photo table does, keeping `start_index` meaningful between the two.
+    ///
+    /// A plain `&self` method, unlike `open_event_tab`/`build_event_tab_entry` — it only reads
+    /// the database/project and spawns a thread, it never touches `App`'s own controls, so it
+    /// doesn't need `Rc<App>`.
+    fn open_image_viewer(&self, event_id: i64, start_index: usize) {
+        let (title, images, source_dir) = {
+            let db = self.db.borrow();
+            let Some(db) = db.as_ref() else { return };
+            let Some(event) = db.get_event(event_id).ok().flatten() else { return };
+            let images = db.event_images(event_id).unwrap_or_default();
+            (event.title, images, self.project.borrow().source_directory.clone())
+        };
+        let Some(source_dir) = source_dir else { return };
+        if images.is_empty() {
+            return;
+        }
+        let start_index = start_index.min(images.len() - 1);
+        image_viewer::open(title, images, start_index, source_dir);
     }
 
     /// An event tab's title input or notes box firing `OnTextInput`: reads both controls'
