@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
@@ -10,6 +10,8 @@ use native_windows_gui as nwg;
 use nwg::stretch::geometry::{Rect, Size};
 use nwg::stretch::style::{AlignItems, Dimension as D, FlexDirection, JustifyContent};
 
+use crate::collection_modal;
+use crate::collection_tree::{self, TreeNodeKind};
 use crate::context_tabs;
 use crate::db;
 use crate::event_tree;
@@ -178,6 +180,17 @@ fn tab_strip_hit_test_at_cursor(container: &nwg::TabsContainer) -> Option<usize>
     }
 }
 
+/// `metadata_button`'s label: "Generate MetaData" until the project's default
+/// collection has been created for the first time, then "Update MetaData" thereafter,
+/// reflecting that later runs only incrementally add newly scanned images to it.
+fn metadata_button_label(default_collection_exists: bool) -> &'static str {
+    if default_collection_exists {
+        "&Update MetaData"
+    } else {
+        "&Generate MetaData"
+    }
+}
+
 /// The controls specific to one flavor of Context Window tab; `key`/`tab`/`layout` on
 /// `ContextTabEntry` are common to both and drive the shared open/switch/close/visibility
 /// machinery regardless of which kind a tab is.
@@ -270,6 +283,23 @@ pub struct App {
     /// node whenever the active tab becomes that event (a direct tree click already moves
     /// Win32's own selection; this covers Prev/Next and tab-strip clicks, which don't).
     event_tree_items: RefCell<HashMap<i64, nwg::TreeItem>>,
+    /// The absolute path to the currently open project database, if any — set by
+    /// `start_db_open`/`ensure_database_provisioned`, cleared by `file_new`. Needed so the
+    /// Image Viewer (which runs on its own thread/window) can be handed the database's
+    /// location for its own toggle-write connection.
+    current_db_path: RefCell<Option<PathBuf>>,
+    /// Maps a collection id to its `nav_tree` leaf node under the Collections root, rebuilt
+    /// every `refresh_nav_tree` — mirrors `event_tree_items`.
+    collection_tree_items: RefCell<HashMap<i64, nwg::TreeItem>>,
+    /// The collection id right-clicked in `nav_tree`'s Collections node, remembered between
+    /// `nav_tree_right_click` (which shows `collection_context_menu`) and its menu items
+    /// (`edit_selected_collection`/`view_selected_collection`/`delete_selected_collection`).
+    collection_context_id: RefCell<Option<i64>>,
+    collection_modal_thread: RefCell<Option<thread::JoinHandle<Option<(String, String, String)>>>>,
+    /// Which collection the pending `collection_modal_thread` result should apply to once it
+    /// closes — `None` means the dialog was opened via Add Collection (create a new row on
+    /// Accept); `Some(id)` means it was opened via Edit (update that row instead).
+    collection_modal_editing_id: RefCell<Option<i64>>,
 
     #[nwg_control(title: "PhotoMatic", flags: "MAIN_WINDOW")]
     #[nwg_events(OnWindowClose: [App::exit], OnKeyPress: [App::on_key_press(SELF, EVT_DATA)])]
@@ -278,6 +308,10 @@ pub struct App {
     #[nwg_control]
     #[nwg_events(OnNotice: [App::settings_dialog_closed])]
     settings_notice: nwg::Notice,
+
+    #[nwg_control]
+    #[nwg_events(OnNotice: [App::collection_modal_closed])]
+    collection_notice: nwg::Notice,
 
     #[nwg_control]
     #[nwg_events(OnNotice: [App::scan_finished])]
@@ -323,6 +357,10 @@ pub struct App {
     #[nwg_control(parent: edit_menu, text: "&Settings...")]
     #[nwg_events(OnMenuItemSelected: [App::open_settings])]
     edit_settings: nwg::MenuItem,
+
+    #[nwg_control(parent: edit_menu, text: "&Add Collection...")]
+    #[nwg_events(OnMenuItemSelected: [App::open_add_collection])]
+    edit_add_collection: nwg::MenuItem,
 
     #[nwg_control(parent: window, text: "&Help")]
     help_menu: nwg::Menu,
@@ -460,6 +498,21 @@ pub struct App {
     #[nwg_control(parent: event_context_menu, text: "&View Images")]
     #[nwg_events(OnMenuItemSelected: [App::open_event_viewer_from_context_menu])]
     event_context_menu_view: nwg::MenuItem,
+
+    #[nwg_control(parent: window, popup: true)]
+    collection_context_menu: nwg::Menu,
+
+    #[nwg_control(parent: collection_context_menu, text: "&Edit")]
+    #[nwg_events(OnMenuItemSelected: [App::edit_selected_collection])]
+    collection_context_menu_edit: nwg::MenuItem,
+
+    #[nwg_control(parent: collection_context_menu, text: "&View")]
+    #[nwg_events(OnMenuItemSelected: [App::view_selected_collection])]
+    collection_context_menu_view: nwg::MenuItem,
+
+    #[nwg_control(parent: collection_context_menu, text: "&Delete")]
+    #[nwg_events(OnMenuItemSelected: [App::delete_selected_collection])]
+    collection_context_menu_delete: nwg::MenuItem,
 
     #[nwg_control(parent: context_frame, flags: "VISIBLE")]
     #[nwg_events(
@@ -782,12 +835,14 @@ impl App {
         *self.project.borrow_mut() = ProjectFile::default();
         *self.current_project_path.borrow_mut() = None;
         *self.db.borrow_mut() = None;
+        *self.current_db_path.borrow_mut() = None;
         self.source_dir_input.set_text("");
         self.set_file_type_checkboxes(&FileExtensions::default());
         self.set_link_raw_images_checkbox(false);
         self.set_event_threshold_inputs(&EventThresholds::default());
         self.nav_tree.clear();
         self.refresh_metadata_button_enabled();
+        self.refresh_metadata_button_label();
         self.refresh_events_button_enabled();
     }
 
@@ -839,6 +894,7 @@ impl App {
             return;
         }
 
+        *self.current_db_path.borrow_mut() = Some(database_path.clone());
         let sender = self.db_notice.sender();
         let handle = thread::spawn(move || {
             let result = db::ProjectDb::open(&database_path);
@@ -870,6 +926,7 @@ impl App {
                 *self.db.borrow_mut() = Some(db);
                 self.refresh_nav_tree();
                 self.refresh_metadata_button_enabled();
+                self.refresh_metadata_button_label();
                 self.refresh_events_button_enabled();
             }
             Err(err) => {
@@ -925,6 +982,20 @@ impl App {
         // The root is expanded so its type nodes are visible without an extra click; a type
         // node itself starts collapsed (unlike a directory node) since it can hold many events.
         self.nav_tree.set_expand_state(&events_root, nwg::ExpandState::Expand);
+
+        // A fixed "Collections" root, always present (even before any user-created collection
+        // exists) — same shape as the Events root above, but flat (no per-type grouping) and
+        // already id-ascending from `list_collections`. Each leaf's id rides as the *negative*
+        // of its `lParam` (`collection_tree::encode_collection_param`) so it can never be
+        // confused with an event leaf's positive id by `nav_tree_click`/`nav_tree_right_click`.
+        self.collection_tree_items.borrow_mut().clear();
+        let collections_root = self.nav_tree.insert_item("Collections", None, nwg::TreeInsert::Last);
+        for collection in db.list_collections().unwrap_or_default() {
+            let param = collection_tree::encode_collection_param(collection.id);
+            let item = self.nav_tree.insert_item_with_param(&collection.name, Some(&collections_root), nwg::TreeInsert::Last, param);
+            self.collection_tree_items.borrow_mut().insert(collection.id, item);
+        }
+        self.nav_tree.set_expand_state(&collections_root, nwg::ExpandState::Expand);
     }
 
     /// Fired via `OnTreeViewRightClick`. `nwg::TreeView` doesn't change selection on a
@@ -940,11 +1011,18 @@ impl App {
     fn nav_tree_right_click(&self) {
         let Some(item) = tree_hit_test_at_cursor(&self.nav_tree) else { return };
 
-        if let Some(event_id) = self.nav_tree.item_param(&item).filter(|&param| param > 0) {
-            *self.event_context_id.borrow_mut() = Some(event_id as i64);
-            let (x, y) = nwg::GlobalCursor::position();
-            self.event_context_menu.popup(x, y);
-            return;
+        match collection_tree::decode_param(self.nav_tree.item_param(&item).unwrap_or(0)) {
+            TreeNodeKind::Event(event_id) => {
+                *self.event_context_id.borrow_mut() = Some(event_id);
+                let (x, y) = nwg::GlobalCursor::position();
+                self.event_context_menu.popup(x, y);
+                return;
+            }
+            TreeNodeKind::Collection(collection_id) => {
+                self.show_collection_context_menu(collection_id);
+                return;
+            }
+            TreeNodeKind::Other => {}
         }
 
         let (dir_name, image_type) = match self.nav_tree.parent(&item) {
@@ -965,6 +1043,141 @@ impl App {
         self.nav_tree_menu.popup(x, y);
     }
 
+    /// Stashes `collection_id` for `collection_context_menu`'s items, sets View's enabled
+    /// state to whether the collection actually has any photos yet, sets Delete's enabled
+    /// state to whether this is *not* the default collection (deleting it would silently
+    /// hand "default" status to a different collection on the next Generate/Update MetaData
+    /// run — see `db::collections::ensure_default_collection`), then pops the menu.
+    fn show_collection_context_menu(&self, collection_id: i64) {
+        let db = self.db.borrow();
+        let Some(db) = db.as_ref() else { return };
+
+        *self.collection_context_id.borrow_mut() = Some(collection_id);
+        let has_images = db.collection_image_count(collection_id).unwrap_or(0) > 0;
+        self.collection_context_menu_view.set_enabled(has_images);
+        let is_default = db.default_collection_id().unwrap_or(None) == Some(collection_id);
+        self.collection_context_menu_delete.set_enabled(!is_default);
+
+        let (x, y) = nwg::GlobalCursor::position();
+        self.collection_context_menu.popup(x, y);
+    }
+
+    /// The `collection_context_menu`'s Edit item: opens the Add/Edit Collection dialog
+    /// prefilled with the collection last right-clicked in `nav_tree`.
+    fn edit_selected_collection(&self) {
+        let Some(collection_id) = self.collection_context_id.borrow_mut().take() else { return };
+        let record = {
+            let db = self.db.borrow();
+            let Some(db) = db.as_ref() else { return };
+            db.get_collection(collection_id).ok().flatten()
+        };
+        let Some(record) = record else { return };
+        self.open_edit_collection(record);
+    }
+
+    /// The `collection_context_menu`'s View item: opens the Image Viewer for the collection
+    /// last right-clicked in `nav_tree`, starting at its first photo — disabled by
+    /// `show_collection_context_menu` while the collection has no photos yet.
+    fn view_selected_collection(&self) {
+        let Some(collection_id) = self.collection_context_id.borrow_mut().take() else { return };
+        self.open_collection_viewer(collection_id);
+    }
+
+    /// The `collection_context_menu`'s Delete item: confirms (since this can't be undone),
+    /// then removes the collection and every `collection_images` row that referenced it, and
+    /// refreshes the tree so it disappears immediately.
+    fn delete_selected_collection(&self) {
+        let Some(collection_id) = self.collection_context_id.borrow_mut().take() else { return };
+
+        let choice = nwg::modal_message(
+            &self.window,
+            &nwg::MessageParams {
+                title: "PhotoMatic",
+                content: "Delete this collection? This cannot be undone.",
+                buttons: nwg::MessageButtons::YesNo,
+                icons: nwg::MessageIcons::Warning,
+            },
+        );
+        if choice != nwg::MessageChoice::Yes {
+            return;
+        }
+
+        let result = {
+            let mut db = self.db.borrow_mut();
+            let Some(db) = db.as_mut() else { return };
+            db.delete_collection(collection_id)
+        };
+        if let Err(err) = result {
+            nwg::simple_message("PhotoMatic", &format!("Failed to delete collection: {err}"));
+            return;
+        }
+        self.refresh_nav_tree();
+    }
+
+    /// Edit > Add Collection...: opens the dialog with no prefilled fields, validated
+    /// against every existing collection's shortcut.
+    fn open_add_collection(&self) {
+        if self.collection_modal_thread.borrow().is_some() {
+            return;
+        }
+        let other_shortcuts: HashSet<String> = {
+            let db = self.db.borrow();
+            let Some(db) = db.as_ref() else {
+                nwg::simple_message("PhotoMatic", "Please open or save a project before adding a collection.");
+                return;
+            };
+            db.list_collections().unwrap_or_default().into_iter().map(|c| c.shortcut).collect()
+        };
+
+        *self.collection_modal_editing_id.borrow_mut() = None;
+        let handle = collection_modal::open(None, other_shortcuts, self.collection_notice.sender());
+        *self.collection_modal_thread.borrow_mut() = Some(handle);
+    }
+
+    /// The collection context menu's Edit item's dialog opener: prefills the dialog with
+    /// `record`'s current fields, validated against every *other* collection's shortcut (its
+    /// own current shortcut is excluded, so re-submitting it unchanged isn't rejected as a
+    /// duplicate of itself).
+    fn open_edit_collection(&self, record: db::models::CollectionRecord) {
+        if self.collection_modal_thread.borrow().is_some() {
+            return;
+        }
+        let other_shortcuts: HashSet<String> = {
+            let db = self.db.borrow();
+            let Some(db) = db.as_ref() else { return };
+            db.list_collections().unwrap_or_default().into_iter().filter(|c| c.id != record.id).map(|c| c.shortcut).collect()
+        };
+
+        *self.collection_modal_editing_id.borrow_mut() = Some(record.id);
+        let handle = collection_modal::open(Some(record), other_shortcuts, self.collection_notice.sender());
+        *self.collection_modal_thread.borrow_mut() = Some(handle);
+    }
+
+    /// Fired via `OnNotice` once the Add/Edit Collection dialog thread finishes. `None`
+    /// (Cancel, or the window's own close button) does nothing; `Some` creates a new
+    /// collection or updates the one being edited depending on what
+    /// `collection_modal_editing_id` was set to when the dialog was opened.
+    fn collection_modal_closed(&self) {
+        let Some(handle) = self.collection_modal_thread.borrow_mut().take() else { return };
+        let Ok(Some((title, notes, shortcut))) = handle.join() else { return };
+
+        let editing_id = self.collection_modal_editing_id.borrow_mut().take();
+        let result = {
+            let db = self.db.borrow();
+            let Some(db) = db.as_ref() else { return };
+            match editing_id {
+                Some(id) => db.update_collection(id, &title, &notes, &shortcut),
+                None => db.create_collection(&title, &notes, &shortcut).map(|_| ()),
+            }
+        };
+
+        if let Err(err) = result {
+            nwg::simple_message("PhotoMatic", &format!("Failed to save collection: {err}"));
+            return;
+        }
+        self.refresh_nav_tree();
+    }
+
     /// The `event_context_menu`'s only item: opens the Image Viewer for the event last
     /// right-clicked in `nav_tree` (recorded by `nav_tree_right_click`), starting at its
     /// first photo.
@@ -982,8 +1195,9 @@ impl App {
     /// needed here. Takes `&Rc<App>` (via `RC_SELF`) because opening a tab needs one.
     fn nav_tree_click(app: &Rc<App>) {
         let Some(item) = app.nav_tree.selected_item() else { return };
-        let Some(event_id) = app.nav_tree.item_param(&item).filter(|&param| param > 0) else { return };
-        Self::open_event_tab(app, event_id as i64);
+        if let TreeNodeKind::Event(event_id) = collection_tree::decode_param(app.nav_tree.item_param(&item).unwrap_or(0)) {
+            Self::open_event_tab(app, event_id);
+        }
     }
 
     /// The `nav_tree_menu`'s "Open in Explorer" item: opens Windows Explorer at the
@@ -1339,11 +1553,42 @@ impl App {
     /// the database/project and spawns a thread, it never touches `App`'s own controls, so it
     /// doesn't need `Rc<App>`.
     fn open_image_viewer(&self, event_id: i64, start_index: usize) {
-        let (title, images, linked_images, source_dir) = {
+        let (title, images) = {
             let db = self.db.borrow();
             let Some(db) = db.as_ref() else { return };
             let Some(event) = db.get_event(event_id).ok().flatten() else { return };
-            let images = db.event_images(event_id).unwrap_or_default();
+            (event.title, db.event_images(event_id).unwrap_or_default())
+        };
+        self.open_viewer_with_images(title, images, start_index);
+    }
+
+    /// The `collection_context_menu`'s View item's opener: the Image Viewer for
+    /// `collection_id`'s photos, ordered by `date_taken`, starting at the first one.
+    /// `show_collection_context_menu` already disables View while a collection has no photos,
+    /// but `open_viewer_with_images`'s own empty check guards this too, in case membership
+    /// changed between the right-click and the click.
+    fn open_collection_viewer(&self, collection_id: i64) {
+        let (title, images) = {
+            let db = self.db.borrow();
+            let Some(db) = db.as_ref() else { return };
+            let Some(collection) = db.get_collection(collection_id).ok().flatten() else { return };
+            (collection.name, db.collection_images(collection_id).unwrap_or_default())
+        };
+        self.open_viewer_with_images(title, images, 0);
+    }
+
+    /// Shared by `open_image_viewer` and `open_collection_viewer`: batch-fetches every
+    /// displayed photo's linked RAW/compressed counterpart (`list_images_by_keys`) and every
+    /// collection each currently belongs to (`collections_for_images`), loads the full list of
+    /// collections (for the viewer's per-collection toggle buttons), and opens the viewer
+    /// window/thread with all of it preloaded.
+    fn open_viewer_with_images(&self, title: String, images: Vec<db::models::ImageRecord>, start_index: usize) {
+        if images.is_empty() {
+            return;
+        }
+        let (linked_images, collections, membership, source_dir, db_path) = {
+            let db = self.db.borrow();
+            let Some(db) = db.as_ref() else { return };
             let linked_keys: Vec<String> = images.iter().filter_map(|i| i.linked_key.clone()).collect();
             let counterparts = db.list_images_by_keys(&linked_keys).unwrap_or_default();
             let linked_images: HashMap<String, db::models::ImageRecord> = images
@@ -1353,14 +1598,20 @@ impl App {
                     Some((img.key.clone(), counterpart.clone()))
                 })
                 .collect();
-            (event.title, images, linked_images, self.project.borrow().source_directory.clone())
+            let keys: Vec<String> = images.iter().map(|i| i.key.clone()).collect();
+            let membership = db.collections_for_images(&keys).unwrap_or_default();
+            let collections = db.list_collections().unwrap_or_default();
+            (
+                linked_images,
+                collections,
+                membership,
+                self.project.borrow().source_directory.clone(),
+                self.current_db_path.borrow().clone(),
+            )
         };
-        let Some(source_dir) = source_dir else { return };
-        if images.is_empty() {
-            return;
-        }
+        let (Some(source_dir), Some(db_path)) = (source_dir, db_path) else { return };
         let start_index = start_index.min(images.len() - 1);
-        image_viewer::open(title, images, linked_images, start_index, source_dir);
+        image_viewer::open(title, images, linked_images, start_index, source_dir, collections, membership, db_path);
     }
 
     /// An event tab's title input or notes box firing `OnTextInput`: reads both controls'
@@ -1569,6 +1820,7 @@ impl App {
         let db_path = path.with_extension("sqlite3");
         match db::ProjectDb::open(&db_path) {
             Ok(db) => {
+                *self.current_db_path.borrow_mut() = Some(db_path.clone());
                 let version = db.schema_version().ok();
                 let relative = path
                     .parent()
@@ -1662,19 +1914,29 @@ impl App {
 
     /// The "Link RAW+JPG" checkbox's click: writes the new value into `self.project`, then
     /// applies it immediately against the database rather than waiting for the next Scan
-    /// Directory run — turning it on relinks right away (so an already-scanned project gets
-    /// links without needing a rescan), turning it off clears every link right away. If the
-    /// database hasn't been opened yet (`self.db` is still `None`, e.g. before the project's
-    /// first save), this silently no-ops on the DB side — the project file still records the
-    /// choice correctly, and the next Scan Directory run's `finish_scan` self-corrects
-    /// regardless (see `db::mod::finish_scan`'s doc comment).
+    /// Directory run — turning it on relinks right away and removes every now-linked RAW from
+    /// whatever collection(s) it was in (so an already-scanned project gets both without
+    /// needing a rescan), turning it off clears every link right away and restores every
+    /// image, RAW included, to the default collection. If the database hasn't been opened yet
+    /// (`self.db` is still `None`, e.g. before the project's first save), this silently no-ops
+    /// on the DB side — the project file still records the choice correctly, and the next Scan
+    /// Directory run's `finish_scan` self-corrects regardless (see `db::mod::finish_scan`'s
+    /// doc comment).
     fn toggle_link_raw_images(&self) {
         let enabled = self.link_raw_images_checkbox.check_state() == nwg::CheckBoxState::Checked;
         self.project.borrow_mut().link_raw_images = enabled;
 
         let mut db = self.db.borrow_mut();
         let Some(db) = db.as_mut() else { return };
-        let result = if enabled { db.relink_raw_images() } else { db.clear_raw_links() };
+        let result = (|| {
+            if enabled {
+                db.relink_raw_images()?;
+                db.remove_linked_raw_images_from_collections()
+            } else {
+                db.clear_raw_links()?;
+                db.restore_all_images_to_default_collection()
+            }
+        })();
         if let Err(err) = result {
             nwg::simple_message("PhotoMatic", &format!("Failed to update RAW/JPG links: {err}"));
         }
@@ -1858,6 +2120,16 @@ impl App {
         self.metadata_button.set_enabled(enabled);
     }
 
+    /// Switches `metadata_button`'s label between "Generate MetaData" and "Update
+    /// MetaData" based on whether the default collection has ever been created —
+    /// derived from the database rather than a separate persisted flag, since
+    /// `db::default_collection_exists` already answers exactly this question.
+    fn refresh_metadata_button_label(&self) {
+        let default_collection_exists =
+            self.db.borrow().as_ref().and_then(|db| db.default_collection_exists().ok()).unwrap_or(false);
+        self.metadata_button.set_text(metadata_button_label(default_collection_exists));
+    }
+
     /// Enables `events_button` under the same "has a scan run" condition as
     /// `refresh_metadata_button_enabled`, rather than requiring Generate MetaData to have
     /// completed first — clicking before any `date_taken` values exist just produces zero
@@ -1943,13 +2215,25 @@ impl App {
             *self.db.borrow_mut() = Some(db);
             return;
         };
+        let project_name = self.current_project_path.borrow().as_ref().and_then(|p| project::project_name_from_path(p));
+        let link_raw_images = self.project.borrow().link_raw_images;
 
         self.metadata_button.set_enabled(false);
         self.metadata_progress.set_visible(true);
 
         let sender = self.metadata_notice.sender();
         let handle = thread::spawn(move || {
-            let db = db;
+            let mut db = db;
+            if let Some(name) = &project_name {
+                let _ = db.sync_default_collection(name, db::DEFAULT_COLLECTION_DESCRIPTION);
+                // `sync_default_collection` unconditionally adds every image, RAW included —
+                // undo that for a linked RAW when linking is on, so this doesn't silently
+                // re-admit one `toggle_link_raw_images`/`finish_scan` already excluded.
+                if link_raw_images {
+                    let _ = db.remove_linked_raw_images_from_collections();
+                }
+            }
+
             let Ok(pending) = db.list_images_pending_metadata() else {
                 sender.notice();
                 return Some(db);
@@ -2007,6 +2291,7 @@ impl App {
         self.metadata_button.set_enabled(true);
         *self.db.borrow_mut() = db;
         self.refresh_metadata_button_enabled();
+        self.refresh_metadata_button_label();
         self.refresh_events_button_enabled();
     }
 }
@@ -2025,5 +2310,15 @@ mod tests {
         assert_eq!(NAV_WIDTH_PERCENT, 0.2);
         assert_eq!(CONTEXT_WIDTH_PERCENT, 0.8);
         assert_eq!(NAV_WIDTH_PERCENT + CONTEXT_WIDTH_PERCENT, 1.0);
+    }
+
+    #[test]
+    fn metadata_button_label_is_generate_before_the_default_collection_exists() {
+        assert_eq!(metadata_button_label(false), "&Generate MetaData");
+    }
+
+    #[test]
+    fn metadata_button_label_is_update_once_it_exists() {
+        assert_eq!(metadata_button_label(true), "&Update MetaData");
     }
 }

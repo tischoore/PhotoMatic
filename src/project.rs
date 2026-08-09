@@ -167,6 +167,12 @@ pub fn save(path: &Path, project: &ProjectFile) -> Result<(), ProjectError> {
     Ok(())
 }
 
+/// The project's display name, derived from its `.json` file's stem (e.g.
+/// `MyTrip.json` -> `"MyTrip"`) — feeds the default collection's name.
+pub fn project_name_from_path(path: &Path) -> Option<String> {
+    path.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +324,16 @@ mod tests {
 
         assert!(result.is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn project_name_from_path_returns_the_file_stem() {
+        assert_eq!(project_name_from_path(Path::new("MyTrip.json")), Some("MyTrip".to_string()));
+        assert_eq!(project_name_from_path(Path::new(r"C:\photos\MyTrip.json")), Some("MyTrip".to_string()));
+    }
+
+    #[test]
+    fn project_name_from_path_is_none_for_a_path_with_no_file_name() {
+        assert_eq!(project_name_from_path(Path::new("..")), None);
     }
 }

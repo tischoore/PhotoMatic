@@ -1,3 +1,4 @@
+mod collections;
 mod directories;
 mod events;
 mod images;
@@ -5,8 +6,10 @@ mod migrations;
 pub mod models;
 mod project_settings;
 
+pub use collections::DEFAULT_COLLECTION_DESCRIPTION;
 pub use events::EventThresholds;
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
@@ -84,14 +87,20 @@ impl ProjectDb {
     /// Called once after every `ScanUnit` from a scan has been applied: stamps
     /// `project_settings.last_scan`, then re-derives RAW/compressed links from scratch —
     /// relinking everything when `link_raw_images` is enabled, or clearing every link when
-    /// it's disabled. Unconditional either way (not skipped when disabled), so the database's
-    /// link state always matches the current project setting regardless of history.
+    /// it's disabled — and keeps collection membership in step with that: a linked RAW is
+    /// removed from every collection it's in (`remove_linked_raw_images_from_collections`),
+    /// or every image is restored to the default collection
+    /// (`restore_all_images_to_default_collection`). Unconditional either way (not skipped
+    /// when disabled), so the database's link state — and now collection membership — always
+    /// matches the current project setting regardless of history.
     pub fn finish_scan(&mut self, link_raw_images: bool) -> Result<(), DbError> {
         project_settings::update_last_scan(&self.conn, Utc::now())?;
         if link_raw_images {
-            images::relink_raw_images(&mut self.conn)
+            images::relink_raw_images(&mut self.conn)?;
+            collections::remove_linked_raw_images_from_collections(&self.conn)
         } else {
-            images::clear_raw_links(&self.conn)
+            images::clear_raw_links(&self.conn)?;
+            collections::restore_all_images_to_default_collection(&self.conn)
         }
     }
 
@@ -106,6 +115,20 @@ impl ProjectDb {
     /// images" is unchecked.
     pub fn clear_raw_links(&self) -> Result<(), DbError> {
         images::clear_raw_links(&self.conn)
+    }
+
+    /// Removes every RAW image that currently has a linked compressed counterpart from every
+    /// collection it belongs to — used immediately when the "Link RAW and compressed images"
+    /// checkbox is checked for an already-scanned project (see `finish_scan` for the
+    /// always-in-sync version applied on every scan).
+    pub fn remove_linked_raw_images_from_collections(&self) -> Result<(), DbError> {
+        collections::remove_linked_raw_images_from_collections(&self.conn)
+    }
+
+    /// Re-adds every image (RAW included) to the default collection — used immediately when
+    /// "Link RAW and compressed images" is unchecked for an already-scanned project.
+    pub fn restore_all_images_to_default_collection(&self) -> Result<(), DbError> {
+        collections::restore_all_images_to_default_collection(&self.conn)
     }
 
     /// The event-eligible image list (excludes a RAW image currently linked to a compressed
@@ -213,6 +236,81 @@ impl ProjectDb {
     pub fn has_edited_events(&self) -> Result<bool, DbError> {
         events::has_edited_events(&self.conn)
     }
+
+    /// Ensures the project's default collection exists (named `name`) and links every
+    /// current image into it — backs the Generate MetaData / Update MetaData button.
+    pub fn sync_default_collection(&mut self, name: &str, description: &str) -> Result<i64, DbError> {
+        collections::sync_default_collection(&mut self.conn, name, description)
+    }
+
+    /// Whether the default collection has ever been created — backs the Generate/Update
+    /// MetaData button's label.
+    pub fn default_collection_exists(&self) -> Result<bool, DbError> {
+        collections::default_collection_exists(&self.conn)
+    }
+
+    /// Creates a new, user-defined collection — backs the "Add Collection..." dialog's
+    /// Accept. Returns its new id.
+    pub fn create_collection(&self, name: &str, description: &str, shortcut: &str) -> Result<i64, DbError> {
+        collections::create_collection(&self.conn, name, description, shortcut)
+    }
+
+    /// Overwrites an existing collection's name/description/shortcut — backs the "Edit
+    /// Collection..." dialog's Accept.
+    pub fn update_collection(&self, id: i64, name: &str, description: &str, shortcut: &str) -> Result<(), DbError> {
+        collections::update_collection(&self.conn, id, name, description, shortcut)
+    }
+
+    /// Deletes a collection and every `collection_images` row that referenced it — backs
+    /// the Left Navigation tree's Delete context menu item.
+    pub fn delete_collection(&mut self, id: i64) -> Result<(), DbError> {
+        collections::delete_collection(&mut self.conn, id)
+    }
+
+    /// Every collection, ordered by id ascending — backs the Left Navigation tree's
+    /// Collections node and the Image Viewer's per-collection toggle buttons.
+    pub fn list_collections(&self) -> Result<Vec<models::CollectionRecord>, DbError> {
+        collections::list_collections(&self.conn)
+    }
+
+    /// A single collection by id, for prefilling the "Edit Collection..." dialog.
+    pub fn get_collection(&self, id: i64) -> Result<Option<models::CollectionRecord>, DbError> {
+        collections::get_collection(&self.conn, id)
+    }
+
+    /// The id of the default collection (structurally, the lowest-id `collections` row) —
+    /// lets the GUI grey out Delete for it.
+    pub fn default_collection_id(&self) -> Result<Option<i64>, DbError> {
+        collections::default_collection_id(&self.conn)
+    }
+
+    /// The photos belonging to one collection, chronologically ordered — backs the
+    /// collection's View context menu item.
+    pub fn collection_images(&self, collection_id: i64) -> Result<Vec<models::ImageRecord>, DbError> {
+        collections::collection_images(&self.conn, collection_id)
+    }
+
+    /// How many photos belong to a collection — backs the "inactive if empty" rule on the
+    /// View context menu item.
+    pub fn collection_image_count(&self, collection_id: i64) -> Result<i64, DbError> {
+        collections::collection_image_count(&self.conn, collection_id)
+    }
+
+    /// Every collection each of `keys` currently belongs to, batched into one query —
+    /// preloads the Image Viewer's per-collection toggle button state.
+    pub fn collections_for_images(&self, keys: &[String]) -> Result<HashMap<String, HashSet<i64>>, DbError> {
+        collections::collections_for_images(&self.conn, keys)
+    }
+
+    /// Adds one image to a collection — an Image Viewer toggle button turning on.
+    pub fn add_image_to_collection(&self, collection_id: i64, image_key: &str) -> Result<(), DbError> {
+        collections::add_image_to_collection(&self.conn, collection_id, image_key)
+    }
+
+    /// Removes one image from a collection — an Image Viewer toggle button turning off.
+    pub fn remove_image_from_collection(&self, collection_id: i64, image_key: &str) -> Result<(), DbError> {
+        collections::remove_image_from_collection(&self.conn, collection_id, image_key)
+    }
 }
 
 /// Normalizes a relative path to forward-slash (POSIX) separators, regardless of the
@@ -283,7 +381,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), 10);
 
         std::fs::remove_file(&path).ok();
     }
@@ -406,6 +504,37 @@ mod tests {
         db.finish_scan(false).unwrap();
         let images = db.list_images().unwrap();
         assert!(images.iter().all(|i| i.linked_key.is_none()), "every link should be cleared once disabled");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn finish_scan_keeps_the_default_collection_in_sync_with_raw_linking() {
+        let path = temp_db_path("finish-scan-collection-sync");
+        std::fs::remove_file(&path).ok();
+        let mut db = ProjectDb::open(&path).unwrap();
+
+        apply_units(
+            &mut db,
+            &[ScanUnit::ToplevelDir {
+                name: "50D".to_string(),
+                files: vec![
+                    ScannedFile { relative_path: PathBuf::from("50D").join("a.cr2"), extension: "cr2".to_string(), toplevel_dir: Some("50D".to_string()) },
+                    ScannedFile { relative_path: PathBuf::from("50D").join("a.jpg"), extension: "jpg".to_string(), toplevel_dir: Some("50D".to_string()) },
+                ],
+            }],
+        );
+        db.finish_scan(false).unwrap();
+        let default_id = db.sync_default_collection("MyTrip", DEFAULT_COLLECTION_DESCRIPTION).unwrap();
+        assert_eq!(db.collection_images(default_id).unwrap().len(), 2, "both images start in the default collection");
+
+        db.finish_scan(true).unwrap();
+        let members = db.collection_images(default_id).unwrap();
+        assert_eq!(members.len(), 1, "the linked RAW should be removed once linking is enabled");
+        assert_eq!(members[0].image_type, "jpg");
+
+        db.finish_scan(false).unwrap();
+        assert_eq!(db.collection_images(default_id).unwrap().len(), 2, "every image should be restored once linking is disabled");
 
         std::fs::remove_file(&path).ok();
     }
@@ -601,6 +730,21 @@ mod tests {
         assert_eq!(settings.date_begin, Some(begin));
         assert_eq!(settings.date_end, Some(end));
         assert_eq!(settings.author, "Alice");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn sync_default_collection_round_trips_through_default_collection_exists() {
+        let path = temp_db_path("sync-default-collection");
+        std::fs::remove_file(&path).ok();
+        let mut db = ProjectDb::open(&path).unwrap();
+
+        apply_units(&mut db, &sample_units());
+        assert!(!db.default_collection_exists().unwrap());
+
+        db.sync_default_collection("MyTrip", DEFAULT_COLLECTION_DESCRIPTION).unwrap();
+        assert!(db.default_collection_exists().unwrap());
 
         std::fs::remove_file(&path).ok();
     }

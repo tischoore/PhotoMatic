@@ -109,6 +109,18 @@ pub struct EventSummary {
     pub image_count: i64,
 }
 
+/// A row in the `collections` table, as listed for the Left Navigation tree's
+/// Collections node and the Image Viewer's per-collection toggle buttons.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectionRecord {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    /// The single-character key assigned to this collection (e.g. `"d"` for the
+    /// default collection), shown as an Image Viewer button's label.
+    pub shortcut: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

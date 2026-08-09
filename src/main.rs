@@ -2,6 +2,8 @@
 
 mod about_modal;
 mod app;
+mod collection_modal;
+mod collection_tree;
 mod context_tabs;
 mod db;
 mod event_tree;

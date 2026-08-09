@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::thread;
@@ -11,24 +11,32 @@ use nwg::stretch::style::{Dimension as D, FlexDirection};
 use nwg::NativeUi;
 
 use crate::context_tabs;
-use crate::db::models::ImageRecord;
+use crate::db;
+use crate::db::models::{CollectionRecord, ImageRecord};
 use crate::explorer;
 use crate::image_viewer_shortcuts::{self, ViewerAction};
 use crate::keyboard;
 
-/// Height of the top row (status label, Prev/Next buttons).
+/// Height of the top row (status label, Prev/Next buttons) and the collection buttons row.
 const TOP_ROW_HEIGHT: f32 = 28.0;
 /// Width of the Prev/Next buttons.
 const NAV_BUTTON_WIDTH: f32 = 60.0;
 /// Width of the Toggle RAW button, wider than Prev/Next since its label is longer.
 const TOGGLE_RAW_BUTTON_WIDTH: f32 = 90.0;
+/// Width of one collection toggle button — just its shortcut letter, so this stays narrow.
+const COLLECTION_BUTTON_WIDTH: f32 = 40.0;
 
-/// Opens the Image Viewer on its own thread for one event's photos, starting at `start_index`.
-/// The window's title is a snapshot of `event_title` at open time — unlike an event tab's live
-/// title input, it's never re-synced if the title is edited afterwards. `linked_images` maps a
-/// displayed photo's own `key` to its linked RAW/compressed counterpart `ImageRecord` (when
-/// "Link RAW and compressed images" has paired it) — the Toggle RAW button's data source, see
-/// `record_to_display`.
+/// Opens the Image Viewer on its own thread for one event's or collection's photos, starting
+/// at `start_index`. The window's title is a snapshot of `title` at open time — unlike an
+/// event tab's live title input, it's never re-synced if the title is edited afterwards.
+/// `linked_images` maps a displayed photo's own `key` to its linked RAW/compressed counterpart
+/// `ImageRecord` (when "Link RAW and compressed images" has paired it) — the Toggle RAW
+/// button's data source, see `record_to_display`. `collections` is every collection in the
+/// project (for one toggle button each) and `membership` maps a displayed photo's own `key` to
+/// the collection ids it currently belongs to — both preloaded once, the same way
+/// `linked_images` is. `db_path` is the project database's absolute path, used only when a
+/// collection toggle button is actually clicked (see `toggle_collection`) — the viewer
+/// otherwise never touches the database itself.
 ///
 /// Runs on its own thread rather than a separate process (see `CLAUDE.md`/the design plan):
 /// NWG requires one message loop per thread, so a second *window* already can't share the main
@@ -39,11 +47,14 @@ const TOGGLE_RAW_BUTTON_WIDTH: f32 = 90.0;
 /// would need is involved. Unlike the Settings dialog, nothing needs to flow back to `App` when
 /// this window closes, so it's fire-and-forget: no `nwg::Notice`/`JoinHandle` bookkeeping.
 pub fn open(
-    event_title: String,
+    title: String,
     images: Vec<ImageRecord>,
     linked_images: HashMap<String, ImageRecord>,
     start_index: usize,
     source_dir: PathBuf,
+    collections: Vec<CollectionRecord>,
+    membership: HashMap<String, HashSet<i64>>,
+    db_path: PathBuf,
 ) {
     thread::spawn(move || {
         // `nwg::ImageDecoder` creates its WIC factory via `CoCreateInstance`, which requires COM
@@ -59,11 +70,14 @@ pub fn open(
 
         let viewer =
             ImageViewer::build_ui(Default::default()).expect("Failed to build the Image Viewer window");
-        viewer.window.set_text(&event_title);
+        viewer.window.set_text(&title);
         *viewer.images.borrow_mut() = images;
         *viewer.linked_images.borrow_mut() = linked_images;
         *viewer.source_dir.borrow_mut() = source_dir;
         *viewer.current_index.borrow_mut() = start_index;
+        *viewer.collections.borrow_mut() = collections;
+        *viewer.membership.borrow_mut() = membership;
+        *viewer.db_path.borrow_mut() = db_path;
 
         nwg::dispatch_thread_events();
     });
@@ -85,10 +99,27 @@ pub struct ImageViewer {
     /// Must be kept alive as long as it's shown — `ImageFrame::set_bitmap` doesn't take
     /// ownership, it just points the control at whatever `Bitmap` is passed in.
     loaded_bitmap: RefCell<Option<nwg::Bitmap>>,
-    /// Keeps the `OnKeyPress` subclass hook from `setup` alive for the window's lifetime. See
-    /// that method's doc comment for why a plain `#[nwg_events(OnKeyPress: ...)]` on `window`
-    /// wouldn't be enough.
+    /// Keeps the `OnKeyPress`/`OnButtonClick` subclass hook from `setup` alive for the
+    /// window's lifetime. See that method's doc comment for why a plain
+    /// `#[nwg_events(OnKeyPress: ...)]` on `window` wouldn't be enough.
     key_press_handler: RefCell<Option<nwg::EventHandler>>,
+    /// Every collection in the project, preloaded once at open time — the source list
+    /// `build_collection_buttons` builds one toggle button from.
+    collections: RefCell<Vec<CollectionRecord>>,
+    /// A displayed photo's own `key` -> the collection ids it currently belongs to, preloaded
+    /// once at open time and kept in sync locally by `toggle_collection` on every click (so a
+    /// button's state never needs a fresh database read to redraw). Membership is a property
+    /// of the *photo*, unlike `showing_counterpart` — it must never be reset on Prev/Next.
+    membership: RefCell<HashMap<String, HashSet<i64>>>,
+    /// The project database's absolute path — opened fresh (and briefly) by
+    /// `toggle_collection` each time a collection button is actually clicked; nothing else in
+    /// this viewer touches the database.
+    db_path: RefCell<PathBuf>,
+    /// One `(checkbox, collection_id)` pair per collection, built once by
+    /// `build_collection_buttons` — `setup`'s click dispatch matches a clicked handle against
+    /// this to know which collection to toggle, and `refresh_collection_buttons` iterates it
+    /// to redraw checked state for the current photo.
+    collection_buttons: RefCell<Vec<(nwg::CheckBox, i64)>>,
 
     #[nwg_resource]
     decoder: nwg::ImageDecoder,
@@ -145,6 +176,7 @@ pub struct ImageViewer {
     image_frame: nwg::ImageFrame,
 
     top_row_layout: nwg::FlexboxLayout,
+    collection_row_layout: nwg::FlexboxLayout,
     root_layout: nwg::FlexboxLayout,
 }
 
@@ -167,14 +199,28 @@ impl ImageViewer {
     /// fires regardless of which of those controls is focused. Needs `&Rc<Self>` (via
     /// `RC_SELF`) for the closure to stay `'static`.
     fn setup(app: &Rc<ImageViewer>) {
+        app.build_collection_buttons();
         app.build_layout();
 
+        // One shared hook for both `OnKeyPress` (Left/Right/Ctrl+W, see this method's doc
+        // comment above) and `OnButtonClick` on the collection toggle buttons — the latter are
+        // built at runtime in `build_collection_buttons`, so (like the dynamic tabs in
+        // `app.rs`'s `build_event_tab_entry`) they're invisible to `native_windows_derive`'s
+        // one-time `#[nwg_events(...)]` dispatch and need their own subclass hook, matched by
+        // handle against `collection_buttons` rather than declared per-control.
         let app_weak = Rc::downgrade(app);
-        let handler = nwg::full_bind_event_handler(&app.window.handle, move |evt, evt_data, _handle| {
-            if evt == nwg::Event::OnKeyPress {
-                if let Some(app) = app_weak.upgrade() {
-                    app.on_key_press(&evt_data);
+        let handler = nwg::full_bind_event_handler(&app.window.handle, move |evt, evt_data, handle| {
+            let Some(app) = app_weak.upgrade() else { return };
+            match evt {
+                nwg::Event::OnKeyPress => app.on_key_press(&evt_data),
+                nwg::Event::OnButtonClick => {
+                    let collection_id =
+                        app.collection_buttons.borrow().iter().find(|(cb, _)| cb.handle == handle).map(|(_, id)| *id);
+                    if let Some(collection_id) = collection_id {
+                        app.toggle_collection(collection_id);
+                    }
                 }
+                _ => {}
             }
         });
         *app.key_press_handler.borrow_mut() = Some(handler);
@@ -183,10 +229,44 @@ impl ImageViewer {
         app.window.set_visible(true);
     }
 
-    /// Lays out the top row (status label flex-growing to the left, Prev/Next pinned right) and
-    /// the image area filling the rest — the same "partial row layout nested into an outer
-    /// column via `child_layout`" technique `app.rs`'s `build_event_tab_entry` uses for its
-    /// Title row, which avoids needing an extra `Frame` just to group the row's controls.
+    /// Builds one `nwg::CheckBox` per collection, labeled with its shortcut — a `CheckBox`'s
+    /// real checked/unchecked visual is reused as the "pressed" look for collection
+    /// membership, the same idiom `app.rs` already uses for the File Types checkboxes, rather
+    /// than inventing a new control style. The label's `&` mnemonic is the collection's own
+    /// shortcut letter, so Alt+<shortcut> toggles it too — since these buttons are built at
+    /// runtime (unknown at compile time) rather than declared with a `\t`-suffixed accelerator
+    /// label, this is the natural per-`CLAUDE.md` way to give each one a keyboard shortcut
+    /// without inventing an unrelated binding; collisions can't happen since shortcuts are
+    /// enforced unique when a collection is created/edited.
+    fn build_collection_buttons(&self) {
+        let mut buttons = Vec::new();
+        for collection in self.collections.borrow().iter() {
+            let mut checkbox = nwg::CheckBox::default();
+            nwg::CheckBox::builder()
+                .parent(&self.window)
+                .text(&format!("&{}", collection.shortcut))
+                .build(&mut checkbox)
+                .expect("Failed to build a collection toggle button");
+            buttons.push((checkbox, collection.id));
+        }
+
+        let mut builder = nwg::FlexboxLayout::builder().parent(&self.window).flex_direction(FlexDirection::Row);
+        for (checkbox, _) in &buttons {
+            builder = builder
+                .child(checkbox)
+                .child_size(Size { width: D::Points(COLLECTION_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) });
+        }
+        builder.build_partial(&self.collection_row_layout).expect("Failed to build the Image Viewer's collection row layout");
+
+        *self.collection_buttons.borrow_mut() = buttons;
+    }
+
+    /// Lays out the top row (status label flex-growing to the left, Prev/Next pinned right),
+    /// the collection toggle buttons row (built by `build_collection_buttons`, called before
+    /// this), and the image area filling the rest — the same "partial row layout nested into
+    /// an outer column via `child_layout`" technique `app.rs`'s `build_event_tab_entry` uses
+    /// for its Title row, which avoids needing an extra `Frame` just to group each row's
+    /// controls.
     fn build_layout(&self) {
         nwg::FlexboxLayout::builder()
             .parent(&self.window)
@@ -207,6 +287,8 @@ impl ImageViewer {
             .parent(&self.window)
             .flex_direction(FlexDirection::Column)
             .child_layout(&self.top_row_layout)
+            .child_size(Size { width: D::Percent(1.0), height: D::Points(TOP_ROW_HEIGHT) })
+            .child_layout(&self.collection_row_layout)
             .child_size(Size { width: D::Percent(1.0), height: D::Points(TOP_ROW_HEIGHT) })
             .child(&self.image_frame)
             .child_size(Size { width: D::Percent(1.0), height: D::Auto })
@@ -308,6 +390,63 @@ impl ImageViewer {
         self.toggle_raw_button.set_enabled(has_counterpart);
         self.prev_button.set_enabled(index > 0);
         self.next_button.set_enabled(index + 1 < images.len());
+        self.refresh_collection_buttons(&record.key);
+    }
+
+    /// Sets every collection toggle button's checked state from `membership`'s entry for
+    /// `image_key` — called at the end of `show_current_image` so this always reflects
+    /// whichever photo (native or, if Toggle RAW is active, its counterpart) is actually being
+    /// shown. Unlike `showing_counterpart`, membership is a property of the *photo*, not a
+    /// per-navigation UI toggle, so it's never reset here — only freshly read for the new key.
+    fn refresh_collection_buttons(&self, image_key: &str) {
+        let membership = self.membership.borrow();
+        let member_of = membership.get(image_key);
+        for (checkbox, collection_id) in self.collection_buttons.borrow().iter() {
+            let checked = member_of.map(|set| set.contains(collection_id)).unwrap_or(false);
+            checkbox.set_check_state(if checked { nwg::CheckBoxState::Checked } else { nwg::CheckBoxState::Unchecked });
+        }
+    }
+
+    /// A collection toggle button's click: flips whether the currently displayed photo belongs
+    /// to that collection, in both the in-memory `membership` map (so the button's own state
+    /// stays right without a database round trip) and the database — via a fresh, short-lived
+    /// connection to `db_path`, the one place this viewer touches the database live, since
+    /// everything else it shows was preloaded once at open time.
+    fn toggle_collection(&self, collection_id: i64) {
+        let images = self.images.borrow();
+        let index = *self.current_index.borrow();
+        let linked_images = self.linked_images.borrow();
+        let showing_counterpart = *self.showing_counterpart.borrow();
+        let Some(record) = record_to_display(&images, &linked_images, index, showing_counterpart) else { return };
+        let key = record.key.clone();
+        drop(linked_images);
+        drop(images);
+
+        let now_member = {
+            let mut membership = self.membership.borrow_mut();
+            let set = membership.entry(key.clone()).or_default();
+            let now_member = !set.contains(&collection_id);
+            if now_member {
+                set.insert(collection_id);
+            } else {
+                set.remove(&collection_id);
+            }
+            now_member
+        };
+
+        let db_path = self.db_path.borrow().clone();
+        if let Ok(db) = db::ProjectDb::open(&db_path) {
+            let result = if now_member {
+                db.add_image_to_collection(collection_id, &key)
+            } else {
+                db.remove_image_from_collection(collection_id, &key)
+            };
+            if let Err(err) = result {
+                nwg::simple_message("PhotoMatic", &format!("Failed to update collection: {err}"));
+            }
+        }
+
+        self.refresh_collection_buttons(&key);
     }
 
     /// Scales a decoded frame down or up to fit `image_frame`'s current size, preserving aspect
