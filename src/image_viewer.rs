@@ -189,8 +189,9 @@ impl ImageViewer {
     /// flash of unlaid-out controls, the same "build while hidden, `set_visible(true)` last"
     /// order `App::init` uses for the main window.
     ///
-    /// Also binds the one `OnKeyPress` hook that makes Left/Right/Ctrl+W work no matter which
-    /// control has keyboard focus. A plain `#[nwg_events(OnKeyPress: ...)]` on `window` (as
+    /// Also binds the one `OnKeyPress` hook that makes Left/Right/Ctrl+W, and each collection's
+    /// shortcut letter, work no matter which control has keyboard focus. A plain
+    /// `#[nwg_events(OnKeyPress: ...)]` on `window` (as
     /// `App` uses for its own window) only fires when `window`'s own `HWND` has focus — the
     /// moment the user clicks Prev/Next, focus moves to that button and stops working. Dynamic
     /// Context Window tabs hit the same problem (see `app.rs`'s `build_event_tab_entry`) and
@@ -311,11 +312,22 @@ impl ImageViewer {
 
     fn on_key_press(&self, data: &nwg::EventData) {
         let ctrl = keyboard::key_down(winapi::um::winuser::VK_CONTROL);
-        match image_viewer_shortcuts::resolve(data.on_key(), ctrl) {
-            Some(ViewerAction::Close) => self.close(),
-            Some(ViewerAction::Prev) => self.prev(),
-            Some(ViewerAction::Next) => self.next(),
+        let key = data.on_key();
+        match image_viewer_shortcuts::resolve(key, ctrl) {
+            Some(ViewerAction::Close) => return self.close(),
+            Some(ViewerAction::Prev) => return self.prev(),
+            Some(ViewerAction::Next) => return self.next(),
             None => {}
+        }
+
+        let shortcuts: Vec<(char, i64)> = self
+            .collections
+            .borrow()
+            .iter()
+            .filter_map(|c| c.shortcut.chars().next().map(|ch| (ch, c.id)))
+            .collect();
+        if let Some(collection_id) = image_viewer_shortcuts::resolve_collection_shortcut(key, ctrl, &shortcuts) {
+            self.toggle_collection(collection_id);
         }
     }
 

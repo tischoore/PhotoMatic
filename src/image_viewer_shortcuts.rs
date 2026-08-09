@@ -21,6 +21,21 @@ pub fn resolve(key: u32, ctrl: bool) -> Option<ViewerAction> {
     }
 }
 
+/// Maps a plain (non-Ctrl) key press to the id of the collection whose shortcut it matches.
+/// Ctrl is excluded so a collection shortcut can never shadow a Ctrl-combo action (e.g. Ctrl+W
+/// close) — only a bare letter press toggles a collection, matching how the checkbox's own `&`
+/// mnemonic is Alt-based rather than Ctrl-based. Case-insensitive since shortcuts are stored
+/// lowercase but virtual-key codes for letters arrive as uppercase ASCII. Takes the shortcut set
+/// as data (rather than a compile-time enum like `ViewerAction`) since collections, and their
+/// shortcuts, are defined at runtime.
+pub fn resolve_collection_shortcut(key: u32, ctrl: bool, shortcuts: &[(char, i64)]) -> Option<i64> {
+    if ctrl {
+        return None;
+    }
+    let pressed = char::from_u32(key)?.to_ascii_lowercase();
+    shortcuts.iter().find(|(ch, _)| ch.to_ascii_lowercase() == pressed).map(|(_, id)| *id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +65,30 @@ mod tests {
     #[test]
     fn unrelated_key_resolves_to_none() {
         assert_eq!(resolve(nwg::keys::_A, true), None);
+    }
+
+    #[test]
+    fn collection_shortcut_matches_its_letter() {
+        let shortcuts = [('d', 1), ('f', 2)];
+        assert_eq!(resolve_collection_shortcut(nwg::keys::_D, false, &shortcuts), Some(1));
+        assert_eq!(resolve_collection_shortcut(nwg::keys::_F, false, &shortcuts), Some(2));
+    }
+
+    #[test]
+    fn collection_shortcut_is_case_insensitive() {
+        let shortcuts = [('D', 1)];
+        assert_eq!(resolve_collection_shortcut(nwg::keys::_D, false, &shortcuts), Some(1));
+    }
+
+    #[test]
+    fn collection_shortcut_ignores_unmatched_key() {
+        let shortcuts = [('d', 1)];
+        assert_eq!(resolve_collection_shortcut(nwg::keys::_A, false, &shortcuts), None);
+    }
+
+    #[test]
+    fn collection_shortcut_is_suppressed_when_ctrl_is_held() {
+        let shortcuts = [('d', 1)];
+        assert_eq!(resolve_collection_shortcut(nwg::keys::_D, true, &shortcuts), None);
     }
 }
