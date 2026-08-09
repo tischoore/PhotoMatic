@@ -88,7 +88,30 @@ pub fn open(
         *viewer.db_path.borrow_mut() = db_path;
         *viewer.image_cache.borrow_mut() = ImageCache::new(IMAGE_CACHE_CAPACITY);
 
-        nwg::dispatch_thread_events();
+        // Not a plain `nwg::dispatch_thread_events()`: that call routes every message through
+        // `IsDialogMessageW`, Win32's dialog-navigation helper, which consumes Left/Right
+        // arrow key-downs to cycle keyboard focus between this window's buttons/checkboxes
+        // before they ever reach `OnKeyPress` — so `image_viewer_shortcuts::resolve` never
+        // saw them, no matter how the event handler was wired. Arrow key-downs are diverted
+        // straight to dispatch instead; every other message (Tab/Enter/Esc, etc.) still goes
+        // through `IsDialogMessageW` exactly as before, so normal dialog-style focus
+        // navigation between controls is unaffected.
+        unsafe {
+            let mut msg: winapi::um::winuser::MSG = std::mem::zeroed();
+            while winapi::um::winuser::GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) != 0 {
+                let consumed_by_dialog_navigation = !image_viewer_shortcuts::bypasses_dialog_navigation(
+                    msg.message,
+                    msg.wParam,
+                ) && winapi::um::winuser::IsDialogMessageW(
+                    winapi::um::winuser::GetAncestor(msg.hwnd, winapi::um::winuser::GA_ROOT),
+                    &mut msg,
+                ) != 0;
+                if !consumed_by_dialog_navigation {
+                    winapi::um::winuser::TranslateMessage(&msg);
+                    winapi::um::winuser::DispatchMessageW(&msg);
+                }
+            }
+        }
     });
 }
 

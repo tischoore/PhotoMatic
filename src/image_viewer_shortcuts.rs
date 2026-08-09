@@ -21,6 +21,17 @@ pub fn resolve(key: u32, ctrl: bool) -> Option<ViewerAction> {
     }
 }
 
+/// Whether a raw Win32 message is a Left/Right arrow key-down that must bypass
+/// `IsDialogMessageW`'s dialog-navigation handling so it reaches `OnKeyPress` (see
+/// `ImageViewer::open`'s message loop) — `IsDialogMessageW` otherwise consumes arrow keys
+/// to cycle keyboard focus between the viewer's buttons/checkboxes before `resolve` ever
+/// sees them, which is why Left/Right silently did nothing despite `resolve` already
+/// mapping them correctly.
+pub fn bypasses_dialog_navigation(message: u32, virtual_key: usize) -> bool {
+    message == winapi::um::winuser::WM_KEYDOWN
+        && (virtual_key == nwg::keys::LEFT as usize || virtual_key == nwg::keys::RIGHT as usize)
+}
+
 /// Maps a plain (non-Ctrl) key press to the id of the collection whose shortcut it matches.
 /// Ctrl is excluded so a collection shortcut can never shadow a Ctrl-combo action (e.g. Ctrl+W
 /// close) — only a bare letter press toggles a collection, matching how the checkbox's own `&`
@@ -65,6 +76,22 @@ mod tests {
     #[test]
     fn unrelated_key_resolves_to_none() {
         assert_eq!(resolve(nwg::keys::_A, true), None);
+    }
+
+    #[test]
+    fn left_and_right_arrow_keydown_bypass_dialog_navigation() {
+        assert!(bypasses_dialog_navigation(winapi::um::winuser::WM_KEYDOWN, nwg::keys::LEFT as usize));
+        assert!(bypasses_dialog_navigation(winapi::um::winuser::WM_KEYDOWN, nwg::keys::RIGHT as usize));
+    }
+
+    #[test]
+    fn unrelated_keydown_does_not_bypass_dialog_navigation() {
+        assert!(!bypasses_dialog_navigation(winapi::um::winuser::WM_KEYDOWN, nwg::keys::_W as usize));
+    }
+
+    #[test]
+    fn non_keydown_message_does_not_bypass_dialog_navigation_even_for_arrow_keys() {
+        assert!(!bypasses_dialog_navigation(winapi::um::winuser::WM_CHAR, nwg::keys::LEFT as usize));
     }
 
     #[test]
