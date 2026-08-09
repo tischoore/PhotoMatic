@@ -1,7 +1,8 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::thread;
 
 use native_windows_derive::NwgUi;
@@ -14,8 +15,15 @@ use crate::context_tabs;
 use crate::db;
 use crate::db::models::{CollectionRecord, ImageRecord};
 use crate::explorer;
+use crate::image_cache::ImageCache;
 use crate::image_viewer_shortcuts::{self, ViewerAction};
 use crate::keyboard;
+
+/// How many decoded/fitted bitmaps the Image Viewer keeps around at once: the current photo
+/// plus every photo `prefetch_targets` looks ahead/behind to. Sized to exactly fit that set (see
+/// `prefetch_targets`) so a normal Prev/Next sequence never evicts a photo the user is about to
+/// land on.
+const IMAGE_CACHE_CAPACITY: usize = 5;
 
 /// Height of the top row (status label, Prev/Next buttons) and the collection buttons row.
 const TOP_ROW_HEIGHT: f32 = 28.0;
@@ -78,6 +86,7 @@ pub fn open(
         *viewer.collections.borrow_mut() = collections;
         *viewer.membership.borrow_mut() = membership;
         *viewer.db_path.borrow_mut() = db_path;
+        *viewer.image_cache.borrow_mut() = ImageCache::new(IMAGE_CACHE_CAPACITY);
 
         nwg::dispatch_thread_events();
     });
@@ -96,9 +105,21 @@ pub struct ImageViewer {
     /// `false` on every Prev/Next, so a toggled RAW view never silently carries over to the
     /// next photo.
     showing_counterpart: RefCell<bool>,
-    /// Must be kept alive as long as it's shown — `ImageFrame::set_bitmap` doesn't take
-    /// ownership, it just points the control at whatever `Bitmap` is passed in.
-    loaded_bitmap: RefCell<Option<nwg::Bitmap>>,
+    /// Decoded/fitted bitmaps for recently-shown photos, keyed by `(index, showing_counterpart)`
+    /// — capped at `IMAGE_CACHE_CAPACITY` (see `prefetch_targets`). `ImageFrame::set_bitmap`
+    /// doesn't take ownership, it just points the control at whatever `Bitmap` is passed in, so
+    /// the entry displayed right now must stay alive in here for as long as it's on screen; since
+    /// `get` promotes it to most-recently-used on every `show_current_image` call, a plain
+    /// Prev/Next sequence never evicts it.
+    image_cache: RefCell<ImageCache<(usize, bool), nwg::Bitmap>>,
+    /// Indices currently being decoded by a `schedule_prefetch` background thread, so a second
+    /// thread is never spawned for the same photo while the first one is still running.
+    prefetch_in_flight: RefCell<HashSet<usize>>,
+    /// Sending half of the prefetch result channel, cloned into every background prefetch
+    /// thread `schedule_prefetch` spawns. `None` until `setup` creates the channel.
+    prefetch_tx: RefCell<Option<mpsc::Sender<PrefetchResult>>>,
+    /// Receiving half of the same channel, drained by `apply_prefetch_results` on `OnNotice`.
+    prefetch_rx: RefCell<Option<mpsc::Receiver<PrefetchResult>>>,
     /// Keeps the `OnKeyPress`/`OnButtonClick` subclass hook from `setup` alive for the
     /// window's lifetime. See that method's doc comment for why a plain
     /// `#[nwg_events(OnKeyPress: ...)]` on `window` wouldn't be enough.
@@ -131,6 +152,17 @@ pub struct ImageViewer {
         OnResize: [ImageViewer::on_resize],
     )]
     window: nwg::Window,
+
+    /// Fires once per background prefetch decode that lands — see `schedule_prefetch`/
+    /// `apply_prefetch_results`. Must be declared after `window`: native-windows-derive's
+    /// auto-parent detection only looks *backward* through already-declared controls for one
+    /// that can parent a child (see `AUTO_PARENT` in native-windows-derive's `ui.rs`), and a
+    /// `Notice` with no parent found fails to build at all — `open`'s `.expect(...)` on
+    /// `build_ui` would then panic on every single open, silently killing the viewer's thread
+    /// before its window ever appears.
+    #[nwg_control]
+    #[nwg_events(OnNotice: [ImageViewer::apply_prefetch_results])]
+    prefetch_notice: nwg::Notice,
 
     #[nwg_control(parent: window, text: "&File")]
     file_menu: nwg::Menu,
@@ -202,6 +234,10 @@ impl ImageViewer {
     fn setup(app: &Rc<ImageViewer>) {
         app.build_collection_buttons();
         app.build_layout();
+
+        let (tx, rx) = mpsc::channel();
+        *app.prefetch_tx.borrow_mut() = Some(tx);
+        *app.prefetch_rx.borrow_mut() = Some(rx);
 
         // One shared hook for both `OnKeyPress` (Left/Right/Ctrl+W, see this method's doc
         // comment above) and `OnButtonClick` on the collection toggle buttons — the latter are
@@ -305,8 +341,13 @@ impl ImageViewer {
     /// Re-fits the current image whenever the window is resized — `ImageFrame::set_bitmap`
     /// displays a bitmap at its own pixel size (centered, never scaled; see `show_current_image`),
     /// so without this the image would stay sized for whatever the window was when it was last
-    /// decoded rather than the window's new size.
+    /// decoded rather than the window's new size. Every cached/in-flight bitmap was fit to the
+    /// *old* size, so both are dropped/abandoned first — `apply_prefetch_results` also guards
+    /// against a stale in-flight decode landing after this by comparing frame sizes, in case one
+    /// was already on its way back from a thread this clears from `prefetch_in_flight`.
     fn on_resize(&self) {
+        self.image_cache.borrow_mut().clear();
+        self.prefetch_in_flight.borrow_mut().clear();
         self.show_current_image();
     }
 
@@ -367,8 +408,12 @@ impl ImageViewer {
         self.show_current_image();
     }
 
-    /// Decodes and displays the current image, updates the status label (path plus "N of M"),
-    /// and enables/disables Prev/Next for the new position.
+    /// Displays the current image, updates the status label (path plus "N of M"), and
+    /// enables/disables Prev/Next for the new position. Serves the bitmap from `image_cache`
+    /// when `schedule_prefetch` (from a previous navigation) already decoded it in the
+    /// background; otherwise decodes it synchronously here, same as before prefetching existed —
+    /// so the first-ever photo, or a jump the cache didn't anticipate, still always shows
+    /// something, just without the speedup.
     ///
     /// WIC (the decoder backing `nwg::ImageDecoder`) has no built-in RAW codec, so a `.CR2` (or
     /// other RAW) file fails to decode — rather than treat that as fatal, this just leaves
@@ -385,24 +430,103 @@ impl ImageViewer {
 
         let source_dir = self.source_dir.borrow();
         let path = explorer::resolve_path(source_dir.as_path(), &record.path);
+        let frame_size = self.image_frame.size();
+        let cache_key = (index, showing_counterpart);
 
-        let bitmap = self
-            .decoder
-            .from_filename(&path.to_string_lossy())
-            .and_then(|source| source.frame(0))
-            .and_then(|frame| self.fit_frame_to_view(&frame))
-            .ok();
+        let mut cache = self.image_cache.borrow_mut();
+        if cache.get(cache_key).is_none() {
+            if let Some(bitmap) = decode_and_fit(&self.decoder, &path, frame_size) {
+                cache.insert(cache_key, bitmap);
+            }
+        }
+        let bitmap = cache.get(cache_key);
 
         let suffix = if bitmap.is_some() { "" } else { " \u{2014} preview unavailable" };
         self.status_label.set_text(&format!("{} ({} of {}){}", record.path, index + 1, images.len(), suffix));
-
-        *self.loaded_bitmap.borrow_mut() = bitmap;
-        self.image_frame.set_bitmap(self.loaded_bitmap.borrow().as_ref());
+        self.image_frame.set_bitmap(bitmap);
+        drop(cache);
 
         self.toggle_raw_button.set_enabled(has_counterpart);
         self.prev_button.set_enabled(index > 0);
         self.next_button.set_enabled(index + 1 < images.len());
         self.refresh_collection_buttons(&record.key);
+
+        drop(source_dir);
+        drop(linked_images);
+        drop(images);
+        self.schedule_prefetch();
+    }
+
+    /// Kicks off a background decode for every photo `prefetch_targets` says should be ready
+    /// ahead of time (skipping one already cached or already being decoded), so a following
+    /// Prev/Next lands on a warm `image_cache` entry instead of blocking on disk I/O and WIC
+    /// decode/resize on the UI thread. Each spawned thread only touches plain owned data (a path
+    /// and a target size) and reports back over `prefetch_tx`/`prefetch_notice` — never `self` —
+    /// so it needs no synchronization with the UI thread beyond that channel.
+    fn schedule_prefetch(&self) {
+        let current = *self.current_index.borrow();
+        let len = self.images.borrow().len();
+        let frame_size = self.image_frame.size();
+        if frame_size.0 == 0 || frame_size.1 == 0 {
+            return;
+        }
+        let Some(tx) = self.prefetch_tx.borrow().clone() else { return };
+
+        for index in prefetch_targets(current, len) {
+            let cache_key = (index, false);
+            if self.image_cache.borrow_mut().get(cache_key).is_some() {
+                continue;
+            }
+            if !self.prefetch_in_flight.borrow_mut().insert(index) {
+                continue;
+            }
+
+            let Some(record) = self.images.borrow().get(index).cloned() else { continue };
+            let path = explorer::resolve_path(self.source_dir.borrow().as_path(), &record.path);
+            let tx = tx.clone();
+            let notice = self.prefetch_notice.sender();
+
+            thread::spawn(move || {
+                // Same reasoning as `image_viewer::open`'s own thread: WIC decoding needs COM
+                // initialized on the calling thread, and this is a fresh one.
+                unsafe {
+                    winapi::um::combaseapi::CoInitializeEx(
+                        std::ptr::null_mut(),
+                        winapi::um::objbase::COINIT_APARTMENTTHREADED,
+                    );
+                }
+                // A fresh `ImageDecoder` rather than reusing the viewer's own: its WIC factory
+                // is a COM object bound to the thread that created it, so it can't be shared
+                // with a background thread's own apartment.
+                if let Ok(decoder) = nwg::ImageDecoder::new() {
+                    if let Some(bitmap) = decode_and_fit(&decoder, &path, frame_size) {
+                        let _ = tx.send(PrefetchResult { index, frame_size, bitmap: SendBitmap(bitmap) });
+                        notice.notice();
+                    }
+                }
+                unsafe {
+                    winapi::um::combaseapi::CoUninitialize();
+                }
+            });
+        }
+    }
+
+    /// Fired via `OnNotice` whenever a `schedule_prefetch` thread lands a decoded bitmap. Drains
+    /// every result currently waiting (more than one can arrive between two pumps of the message
+    /// loop) and files each into `image_cache` — unless the window was resized since that thread
+    /// was spawned, in which case the bitmap was fit to a now-wrong size and is simply dropped;
+    /// `on_resize` already cleared `prefetch_in_flight`/`image_cache` for the new size, and a
+    /// fresh prefetch for the current size will follow from the next `show_current_image`.
+    fn apply_prefetch_results(&self) {
+        let current_frame_size = self.image_frame.size();
+        let rx = self.prefetch_rx.borrow();
+        let Some(rx) = rx.as_ref() else { return };
+        while let Ok(result) = rx.try_recv() {
+            self.prefetch_in_flight.borrow_mut().remove(&result.index);
+            if result.frame_size == current_frame_size {
+                self.image_cache.borrow_mut().insert((result.index, false), result.bitmap.0);
+            }
+        }
     }
 
     /// Sets every collection toggle button's checked state from `membership`'s entry for
@@ -461,25 +585,6 @@ impl ImageViewer {
         self.refresh_collection_buttons(&key);
     }
 
-    /// Scales a decoded frame down or up to fit `image_frame`'s current size, preserving aspect
-    /// ratio. `nwg::ImageFrame` centers a bitmap smaller than the control and crops one larger
-    /// than it, but never scales (confirmed by reading `image_frame.rs`) — without this, a
-    /// full-resolution DSLR photo would only ever show its center crop.
-    fn fit_frame_to_view(&self, frame: &nwg::ImageData) -> Result<nwg::Bitmap, nwg::NwgError> {
-        let (frame_w, frame_h) = self.image_frame.size();
-        let (img_w, img_h) = frame.size();
-        if frame_w == 0 || frame_h == 0 || img_w == 0 || img_h == 0 {
-            return frame.as_bitmap();
-        }
-
-        let scale = (frame_w as f64 / img_w as f64).min(frame_h as f64 / img_h as f64);
-        let target = [
-            ((img_w as f64 * scale).round() as u32).max(1),
-            ((img_h as f64 * scale).round() as u32).max(1),
-        ];
-        self.decoder.resize_image(frame, target)?.as_bitmap()
-    }
-
     /// Edit > Meta Data...: every database field for the current photo, in a dialog locked to
     /// this window (`nwg::modal_info_message`, unlike `nwg::simple_message`, takes a parent and
     /// disables it for the duration — a genuine modal). All of it is already sitting in the
@@ -496,6 +601,74 @@ impl ImageViewer {
     fn show_about(&self) {
         nwg::simple_message("About PhotoMatic Image Viewer", "PhotoMatic image viewer. Tischer 2026");
     }
+}
+
+/// A `schedule_prefetch` thread's result, sent back over `prefetch_tx`/`prefetch_notice`. Carries
+/// the `image_frame` size the bitmap was fit to (not just the index) so `apply_prefetch_results`
+/// can detect and discard one that finished after a resize made it the wrong size.
+struct PrefetchResult {
+    index: usize,
+    frame_size: (u32, u32),
+    bitmap: SendBitmap,
+}
+
+/// Wraps `nwg::Bitmap` so a freshly decoded one can cross the `mpsc::channel` from a prefetch
+/// thread back to the UI thread. Safe because a GDI bitmap handle (`HBITMAP`), unlike a window
+/// handle, has no thread affinity — Windows allows using or deleting it from any thread. Only the
+/// *decoding* that produces it (WIC, backed by COM) needs its own apartment-threaded COM per
+/// thread, which `schedule_prefetch`'s spawned closure already sets up the same way
+/// `image_viewer::open`'s own thread does.
+struct SendBitmap(nwg::Bitmap);
+unsafe impl Send for SendBitmap {}
+
+/// Decodes `path` and scales it to fit inside `frame_size`, preserving aspect ratio — the
+/// synchronous path in `show_current_image` and every `schedule_prefetch` background thread both
+/// go through this, each with their own `nwg::ImageDecoder` (an `ImageDecoder`'s WIC factory is a
+/// COM object bound to whichever thread created it, so a background thread can't reuse the
+/// viewer's own).
+fn decode_and_fit(decoder: &nwg::ImageDecoder, path: &Path, frame_size: (u32, u32)) -> Option<nwg::Bitmap> {
+    let source = decoder.from_filename(&path.to_string_lossy()).ok()?;
+    let frame = source.frame(0).ok()?;
+    match fitted_target_size(frame_size, frame.size()) {
+        Some(target) => decoder.resize_image(&frame, target).ok()?.as_bitmap().ok(),
+        None => frame.as_bitmap().ok(),
+    }
+}
+
+/// The pixel size an `img`-sized frame should be resized to so it fits inside `frame_size`
+/// without changing its aspect ratio. `nwg::ImageFrame` centers a bitmap smaller than the control
+/// and crops one larger than it, but never scales (confirmed by reading `image_frame.rs`) —
+/// without this, a full-resolution DSLR photo would only ever show its center crop. `None` when
+/// either size has a zero dimension (nothing meaningful to fit to/from), in which case the caller
+/// falls back to the frame's native size.
+fn fitted_target_size(frame_size: (u32, u32), img: (u32, u32)) -> Option<[u32; 2]> {
+    let (frame_w, frame_h) = frame_size;
+    let (img_w, img_h) = img;
+    if frame_w == 0 || frame_h == 0 || img_w == 0 || img_h == 0 {
+        return None;
+    }
+
+    let scale = (frame_w as f64 / img_w as f64).min(frame_h as f64 / img_h as f64);
+    Some([((img_w as f64 * scale).round() as u32).max(1), ((img_h as f64 * scale).round() as u32).max(1)])
+}
+
+/// Which photo indices `schedule_prefetch` should try to have decoded ahead of time once
+/// `current` is showing: the next two (favoring the direction Next moves, since that's the more
+/// common browsing direction and the user's explicit ask — buffering "the next next image") and
+/// the one before. Bounds-checked against `len` and never includes `current` itself. Kept as a
+/// free function, independent of `RefCell`/threading, so it's unit-testable on its own.
+fn prefetch_targets(current: usize, len: usize) -> Vec<usize> {
+    let mut targets = Vec::new();
+    if current + 1 < len {
+        targets.push(current + 1);
+    }
+    if current + 2 < len {
+        targets.push(current + 2);
+    }
+    if current > 0 {
+        targets.push(current - 1);
+    }
+    targets
 }
 
 /// Every `ImageRecord` field as a label:value line, for the Meta Data dialog. Reuses
@@ -586,5 +759,42 @@ mod tests {
         let linked = HashMap::new();
 
         assert!(record_to_display(&images, &linked, 5, false).is_none());
+    }
+
+    #[test]
+    fn prefetch_targets_looks_two_ahead_and_one_behind_in_the_middle() {
+        assert_eq!(prefetch_targets(5, 10), vec![6, 7, 4]);
+    }
+
+    #[test]
+    fn prefetch_targets_omits_out_of_bounds_neighbors_at_the_start() {
+        assert_eq!(prefetch_targets(0, 10), vec![1, 2]);
+    }
+
+    #[test]
+    fn prefetch_targets_omits_out_of_bounds_neighbors_at_the_end() {
+        assert_eq!(prefetch_targets(9, 10), vec![8]);
+    }
+
+    #[test]
+    fn prefetch_targets_is_empty_for_a_single_image() {
+        assert_eq!(prefetch_targets(0, 1), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn fitted_target_size_scales_down_preserving_aspect_ratio() {
+        let target = fitted_target_size((100, 100), (200, 100)).unwrap();
+        assert_eq!(target, [100, 50]);
+    }
+
+    #[test]
+    fn fitted_target_size_scales_up_preserving_aspect_ratio() {
+        let target = fitted_target_size((400, 400), (100, 200)).unwrap();
+        assert_eq!(target, [200, 400]);
+    }
+
+    #[test]
+    fn fitted_target_size_is_none_for_a_zero_sized_frame() {
+        assert!(fitted_target_size((0, 100), (200, 100)).is_none());
     }
 }

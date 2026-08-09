@@ -492,6 +492,10 @@ pub struct App {
     #[nwg_events(OnMenuItemSelected: [App::open_image_list_tab(RC_SELF)])]
     nav_tree_menu_image_list: nwg::MenuItem,
 
+    #[nwg_control(parent: nav_tree_menu, text: "&View Images")]
+    #[nwg_events(OnMenuItemSelected: [App::open_directory_image_viewer])]
+    nav_tree_menu_view_images: nwg::MenuItem,
+
     #[nwg_control(parent: window, popup: true)]
     event_context_menu: nwg::Menu,
 
@@ -1240,6 +1244,26 @@ impl App {
         let new_index = tabs.len() - 1;
         app.context_tabs_container.set_selected_tab(new_index);
         app.sync_context_tab_visibility(&tabs);
+    }
+
+    /// The `nav_tree_menu`'s "View Images" item: opens the Image Viewer directly for the
+    /// directory/type last right-clicked in `nav_tree`, starting at its first photo — the same
+    /// query `open_image_list_tab` uses to populate its table (`list_images_by_directory`), and
+    /// the same title (`context_tabs::tab_title`), so the two entry points agree on which photos
+    /// and in what order. A plain `&self` method like `open_image_viewer`/`open_collection_viewer`:
+    /// it only reads the database and spawns the viewer's own thread, it never touches `App`'s
+    /// own controls.
+    fn open_directory_image_viewer(&self) {
+        let Some(dir_name) = self.nav_tree_context_dir.borrow_mut().take() else { return };
+        let image_type = self.nav_tree_context_type.borrow_mut().take();
+        let title = context_tabs::tab_title(&dir_name, image_type.as_deref());
+
+        let images = {
+            let db = self.db.borrow();
+            let Some(db) = db.as_ref() else { return };
+            db.list_images_by_directory(&dir_name, image_type.as_deref()).unwrap_or_default()
+        };
+        self.open_viewer_with_images(title, images, 0);
     }
 
     /// Builds one Context Window tab: a `Tab` in `context_tabs_container` holding a

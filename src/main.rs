@@ -10,6 +10,7 @@ mod event_tree;
 mod events;
 mod exif;
 mod explorer;
+mod image_cache;
 mod image_viewer;
 mod image_viewer_shortcuts;
 mod keyboard;
