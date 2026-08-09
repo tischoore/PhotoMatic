@@ -33,6 +33,13 @@ pub struct ProjectFile {
     /// The Generate Events button's per-tier gap thresholds.
     #[serde(default, skip_serializing_if = "EventThresholds::is_default")]
     pub event_thresholds: EventThresholds,
+
+    /// Whether Scan Directory should also pair each `.cr2` file with its compressed sibling
+    /// (same directory + filename stem, case-insensitive, strictly 1:1) and store a
+    /// bidirectional link between the two `images` rows — see
+    /// `db::images::relink_raw_images`. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub link_raw_images: bool,
 }
 
 /// The Generate Events button's per-tier gap thresholds: two photos in the same tier's
@@ -282,6 +289,23 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.trim(), "{}");
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn link_raw_images_defaults_to_false() {
+        assert!(!ProjectFile::default().link_raw_images);
+    }
+
+    #[test]
+    fn round_trips_link_raw_images_through_json() {
+        let path = temp_path("project-link-raw-images.json");
+        let project = ProjectFile { link_raw_images: true, ..ProjectFile::default() };
+
+        save(&path, &project).unwrap();
+        let loaded = load(&path).unwrap();
+
+        assert_eq!(loaded, project);
         std::fs::remove_file(&path).ok();
     }
 

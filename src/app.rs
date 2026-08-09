@@ -55,6 +55,9 @@ const FILE_TYPES_ROW_HEIGHT: f32 = 28.0;
 /// of the two label strings) without clipping.
 const PROJECT_INFO_LABEL_WIDTH: f32 = 130.0;
 const FILE_TYPE_CHECKBOX_WIDTH: f32 = 80.0;
+/// Width of the "Link RAW+JPG" checkbox, wider than a File Type checkbox since its label is
+/// longer.
+const LINK_RAW_CHECKBOX_WIDTH: f32 = 150.0;
 /// Vertical gap between the Source Directory and File Types rows.
 const PROJECT_INFO_ROW_GAP: f32 = 8.0;
 /// Height of `top_block_frame` (Source Directory + File Types). Same reasoning as the
@@ -375,6 +378,10 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::sync_file_extensions_from_checkboxes])]
     file_type_gif: nwg::CheckBox,
 
+    #[nwg_control(parent: top_block_frame, text: "&Link RAW+JPG", check_state: nwg::CheckBoxState::Unchecked)]
+    #[nwg_events(OnButtonClick: [App::toggle_link_raw_images])]
+    link_raw_images_checkbox: nwg::CheckBox,
+
     #[nwg_control(parent: top_block_frame, text: "Event Gaps:")]
     event_thresholds_label: nwg::Label,
 
@@ -576,6 +583,9 @@ impl App {
             .child_margin(row_margin)
             .child(&self.file_type_gif)
             .child_size(Size { width: D::Points(FILE_TYPE_CHECKBOX_WIDTH), height: D::Points(FILE_TYPES_ROW_HEIGHT) })
+            .child_margin(row_margin)
+            .child(&self.link_raw_images_checkbox)
+            .child_size(Size { width: D::Points(LINK_RAW_CHECKBOX_WIDTH), height: D::Points(FILE_TYPES_ROW_HEIGHT) })
             .build_partial(&self.file_types_layout)
             .expect("Failed to build the File Types row layout");
 
@@ -774,6 +784,7 @@ impl App {
         *self.db.borrow_mut() = None;
         self.source_dir_input.set_text("");
         self.set_file_type_checkboxes(&FileExtensions::default());
+        self.set_link_raw_images_checkbox(false);
         self.set_event_threshold_inputs(&EventThresholds::default());
         self.nav_tree.clear();
         self.refresh_metadata_button_enabled();
@@ -799,6 +810,7 @@ impl App {
                 let source_dir = loaded.source_directory.clone();
                 let database_path = loaded.database_path.clone();
                 self.set_file_type_checkboxes(&loaded.file_extensions);
+                self.set_link_raw_images_checkbox(loaded.link_raw_images);
                 self.set_event_threshold_inputs(&loaded.event_thresholds);
                 *self.project.borrow_mut() = loaded;
                 *self.current_project_path.borrow_mut() = Some(path.clone());
@@ -1318,23 +1330,37 @@ impl App {
     /// query is introduced — `event_images` already orders photos the same way the event tab's
     /// photo table does, keeping `start_index` meaningful between the two.
     ///
+    /// Also batch-fetches every displayed photo's linked RAW/compressed counterpart in one
+    /// extra query (`list_images_by_keys`), keyed by the *displayed* photo's own key so the
+    /// viewer's Toggle RAW button can look one up in O(1) regardless of which side (RAW or
+    /// compressed) happens to be in `images`.
+    ///
     /// A plain `&self` method, unlike `open_event_tab`/`build_event_tab_entry` — it only reads
     /// the database/project and spawns a thread, it never touches `App`'s own controls, so it
     /// doesn't need `Rc<App>`.
     fn open_image_viewer(&self, event_id: i64, start_index: usize) {
-        let (title, images, source_dir) = {
+        let (title, images, linked_images, source_dir) = {
             let db = self.db.borrow();
             let Some(db) = db.as_ref() else { return };
             let Some(event) = db.get_event(event_id).ok().flatten() else { return };
             let images = db.event_images(event_id).unwrap_or_default();
-            (event.title, images, self.project.borrow().source_directory.clone())
+            let linked_keys: Vec<String> = images.iter().filter_map(|i| i.linked_key.clone()).collect();
+            let counterparts = db.list_images_by_keys(&linked_keys).unwrap_or_default();
+            let linked_images: HashMap<String, db::models::ImageRecord> = images
+                .iter()
+                .filter_map(|img| {
+                    let counterpart = counterparts.iter().find(|c| Some(&c.key) == img.linked_key.as_ref())?;
+                    Some((img.key.clone(), counterpart.clone()))
+                })
+                .collect();
+            (event.title, images, linked_images, self.project.borrow().source_directory.clone())
         };
         let Some(source_dir) = source_dir else { return };
         if images.is_empty() {
             return;
         }
         let start_index = start_index.min(images.len() - 1);
-        image_viewer::open(title, images, start_index, source_dir);
+        image_viewer::open(title, images, linked_images, start_index, source_dir);
     }
 
     /// An event tab's title input or notes box firing `OnTextInput`: reads both controls'
@@ -1634,6 +1660,35 @@ impl App {
         self.file_type_gif.set_check_state(state(extensions.gif));
     }
 
+    /// The "Link RAW+JPG" checkbox's click: writes the new value into `self.project`, then
+    /// applies it immediately against the database rather than waiting for the next Scan
+    /// Directory run — turning it on relinks right away (so an already-scanned project gets
+    /// links without needing a rescan), turning it off clears every link right away. If the
+    /// database hasn't been opened yet (`self.db` is still `None`, e.g. before the project's
+    /// first save), this silently no-ops on the DB side — the project file still records the
+    /// choice correctly, and the next Scan Directory run's `finish_scan` self-corrects
+    /// regardless (see `db::mod::finish_scan`'s doc comment).
+    fn toggle_link_raw_images(&self) {
+        let enabled = self.link_raw_images_checkbox.check_state() == nwg::CheckBoxState::Checked;
+        self.project.borrow_mut().link_raw_images = enabled;
+
+        let mut db = self.db.borrow_mut();
+        let Some(db) = db.as_mut() else { return };
+        let result = if enabled { db.relink_raw_images() } else { db.clear_raw_links() };
+        if let Err(err) = result {
+            nwg::simple_message("PhotoMatic", &format!("Failed to update RAW/JPG links: {err}"));
+        }
+    }
+
+    /// Sets the "Link RAW+JPG" checkbox to reflect `enabled` — used when starting a new
+    /// project or loading one, the reverse direction of `toggle_link_raw_images`. Deliberately
+    /// does not touch the database: a loaded project's DB already carries whatever
+    /// `linked_key` state it was saved with, and a new project has no DB yet.
+    fn set_link_raw_images_checkbox(&self, enabled: bool) {
+        let state = if enabled { nwg::CheckBoxState::Checked } else { nwg::CheckBoxState::Unchecked };
+        self.link_raw_images_checkbox.set_check_state(state);
+    }
+
     /// Writes the Event Gaps inputs' current values into `self.project`, read at the point
     /// Generate Events runs (the same pull-based pattern `sync_source_directory_from_input`
     /// uses at `start_scan`, rather than syncing on every keystroke). A box that doesn't
@@ -1733,6 +1788,7 @@ impl App {
             return;
         };
         let extensions = project.file_extensions.clone();
+        let link_raw_images = project.link_raw_images;
         drop(project);
 
         // Moved into the closure alongside `root`/`extensions`, same ownership-transfer
@@ -1756,7 +1812,7 @@ impl App {
                 }
             });
             if let Some(db) = db.as_mut() {
-                let _ = db.finish_scan();
+                let _ = db.finish_scan(link_raw_images);
             }
             sender.notice();
             (result, db)
@@ -1848,7 +1904,7 @@ impl App {
                 }
             }
 
-            let images = db.list_images().unwrap_or_default();
+            let images = db.list_images_for_event_generation().unwrap_or_default();
             let thresholds = self.project.borrow().event_thresholds.clone();
             let db_thresholds = db::EventThresholds {
                 burst: chrono::Duration::seconds(thresholds.burst_gap_seconds as i64),

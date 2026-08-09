@@ -13,7 +13,8 @@ fn migrations() -> &'static Migrations<'static> {
             M::up(include_str!("migrations/0005_add_image_gps.sql")),
             M::up(include_str!("migrations/0006_reset_metadata_read_at_for_gps_backfill.sql")),
             M::up(include_str!("migrations/0007_add_event_title.sql")),
-            // M::up(include_str!("migrations/0008_....sql")),  <- next migration goes here
+            M::up(include_str!("migrations/0008_add_image_linked_key.sql")),
+            // M::up(include_str!("migrations/0009_....sql")),  <- next migration goes here
         ])
     })
 }

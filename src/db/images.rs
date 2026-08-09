@@ -3,6 +3,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use super::models::ImageRecord;
 use super::DbError;
+use crate::raw_linking::pair_raw_with_compressed;
 
 /// Hashes `path` into a stable, non-cryptographic dedup key (xxh3, lowercase hex).
 /// Same input always produces the same key; different paths produce different keys.
@@ -35,7 +36,7 @@ pub fn upsert_images(conn: &mut Connection, images: &[ImageRecord]) -> Result<()
 /// event's photo table can be built with the same column set/order as every other
 /// `ImageRecord` query, without duplicating it.
 pub(super) const IMAGE_COLUMNS: &str = "key, path, image_type, toplevel_dir, date_taken, width, height, \
-     exposure_time, iso, focal_length, gps_latitude, gps_longitude, gps_altitude, metadata_read_at";
+     exposure_time, iso, focal_length, gps_latitude, gps_longitude, gps_altitude, metadata_read_at, linked_key";
 
 pub(super) fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord> {
     Ok(ImageRecord {
@@ -53,6 +54,7 @@ pub(super) fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord
         gps_longitude: row.get(11)?,
         gps_altitude: row.get(12)?,
         metadata_read_at: row.get(13)?,
+        linked_key: row.get(14)?,
     })
 }
 
@@ -136,6 +138,70 @@ pub fn list_images_by_directory(
     rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Sqlite)
 }
 
+/// Re-derives every `linked_key` from scratch: clears all existing links, then pairs every
+/// RAW image against its compressed sibling (via `raw_linking::pair_raw_with_compressed`,
+/// run over the *entire* `images` table, not just the most recent scan batch, since a pairing
+/// can span two separate scans) and writes both directions of each pair. One transaction, so
+/// a failure never leaves a half-relinked table. Backs "Link RAW and compressed images" —
+/// called at the end of every scan while the option is enabled, and once immediately when the
+/// option is turned on for an already-scanned project.
+pub fn relink_raw_images(conn: &mut Connection) -> Result<(), DbError> {
+    let tx = conn.transaction().map_err(DbError::Sqlite)?;
+    tx.execute("UPDATE images SET linked_key = NULL", []).map_err(DbError::Sqlite)?;
+
+    let candidates: Vec<ImageRecord> = {
+        let mut stmt = tx.prepare(&format!("SELECT {IMAGE_COLUMNS} FROM images")).map_err(DbError::Sqlite)?;
+        let rows = stmt.query_map([], map_image_row).map_err(DbError::Sqlite)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Sqlite)?
+    };
+
+    {
+        let mut stmt = tx.prepare("UPDATE images SET linked_key = ?2 WHERE key = ?1").map_err(DbError::Sqlite)?;
+        for (raw_key, compressed_key) in pair_raw_with_compressed(&candidates) {
+            stmt.execute(rusqlite::params![raw_key, compressed_key]).map_err(DbError::Sqlite)?;
+            stmt.execute(rusqlite::params![compressed_key, raw_key]).map_err(DbError::Sqlite)?;
+        }
+    }
+
+    tx.commit().map_err(DbError::Sqlite)
+}
+
+/// Clears every `linked_key` immediately — backs unchecking "Link RAW and compressed images".
+pub fn clear_raw_links(conn: &Connection) -> Result<(), DbError> {
+    conn.execute("UPDATE images SET linked_key = NULL", []).map_err(DbError::Sqlite)?;
+    Ok(())
+}
+
+/// Every image except a RAW image that's currently linked to a compressed sibling — the
+/// event-eligible image list Generate Events clusters, so a linked RAW never forms or joins
+/// its own event; only its compressed sibling participates. An unlinked RAW (no counterpart
+/// found, or "Link RAW and compressed images" disabled) is included as normal.
+pub fn list_event_eligible_images(conn: &Connection) -> Result<Vec<ImageRecord>, DbError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {IMAGE_COLUMNS} FROM images \
+             WHERE NOT (image_type = 'cr2' AND linked_key IS NOT NULL) ORDER BY path"
+        ))
+        .map_err(DbError::Sqlite)?;
+    let rows = stmt.query_map([], map_image_row).map_err(DbError::Sqlite)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Sqlite)
+}
+
+/// Images matching any of `keys`, in no particular order — used by the Image Viewer to
+/// batch-fetch every displayed photo's linked counterpart in a single query rather than one
+/// query per photo. Returns an empty list without touching the database when `keys` is empty.
+pub fn list_images_by_keys(conn: &Connection, keys: &[String]) -> Result<Vec<ImageRecord>, DbError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; keys.len()].join(",");
+    let mut stmt = conn
+        .prepare(&format!("SELECT {IMAGE_COLUMNS} FROM images WHERE key IN ({placeholders})"))
+        .map_err(DbError::Sqlite)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(keys), map_image_row).map_err(DbError::Sqlite)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Sqlite)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +214,116 @@ mod tests {
     #[test]
     fn different_paths_hash_to_different_keys() {
         assert_ne!(image_key("sub/a.jpg"), image_key("sub/b.jpg"));
+    }
+
+    fn image(key: &str, path: &str, image_type: &str) -> ImageRecord {
+        ImageRecord { key: key.to_string(), path: path.to_string(), image_type: image_type.to_string(), ..ImageRecord::default() }
+    }
+
+    fn migrated_conn() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&mut conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn relink_raw_images_links_both_directions_of_a_pair() {
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("raw", "50D/a.cr2", "cr2"), image("jpg", "50D/a.jpg", "jpg")]).unwrap();
+
+        relink_raw_images(&mut conn).unwrap();
+
+        let images = list_images(&conn).unwrap();
+        let raw = images.iter().find(|i| i.key == "raw").unwrap();
+        let jpg = images.iter().find(|i| i.key == "jpg").unwrap();
+        assert_eq!(raw.linked_key.as_deref(), Some("jpg"));
+        assert_eq!(jpg.linked_key.as_deref(), Some("raw"));
+    }
+
+    #[test]
+    fn relink_raw_images_leaves_unmatched_images_unlinked() {
+        // Neither of these RAWs has a same-stem compressed sibling in its own directory —
+        // `50D/b.jpg` doesn't match `a`'s stem, and `other/a.jpg` doesn't share `50D/a.cr2`'s
+        // directory — so nothing here should end up linked.
+        let mut conn = migrated_conn();
+        upsert_images(
+            &mut conn,
+            &[image("raw", "50D/a.cr2", "cr2"), image("wrong-stem", "50D/b.jpg", "jpg"), image("wrong-dir", "other/a.jpg", "jpg")],
+        )
+        .unwrap();
+
+        relink_raw_images(&mut conn).unwrap();
+
+        let images = list_images(&conn).unwrap();
+        assert!(images.iter().all(|i| i.linked_key.is_none()));
+    }
+
+    #[test]
+    fn relink_raw_images_clears_stale_links_before_recomputing() {
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("raw", "50D/a.cr2", "cr2"), image("jpg", "50D/a.jpg", "jpg")]).unwrap();
+        relink_raw_images(&mut conn).unwrap();
+
+        // Simulates the jpg being renamed between scans, so it no longer shares a stem with
+        // the RAW — a second relink must drop the stale link rather than leaving the RAW
+        // pointing at a key whose path has since diverged.
+        upsert_images(&mut conn, &[image("jpg", "50D/renamed.jpg", "jpg")]).unwrap();
+        relink_raw_images(&mut conn).unwrap();
+
+        let images = list_images(&conn).unwrap();
+        assert!(images.iter().all(|i| i.linked_key.is_none()));
+    }
+
+    #[test]
+    fn clear_raw_links_nulls_every_linked_key() {
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("raw", "50D/a.cr2", "cr2"), image("jpg", "50D/a.jpg", "jpg")]).unwrap();
+        relink_raw_images(&mut conn).unwrap();
+
+        clear_raw_links(&conn).unwrap();
+
+        let images = list_images(&conn).unwrap();
+        assert!(images.iter().all(|i| i.linked_key.is_none()));
+    }
+
+    #[test]
+    fn list_event_eligible_images_excludes_a_linked_raw_but_keeps_its_compressed_counterpart() {
+        let mut conn = migrated_conn();
+        upsert_images(
+            &mut conn,
+            &[
+                image("raw", "50D/a.cr2", "cr2"),
+                image("jpg", "50D/a.jpg", "jpg"),
+                image("lonely-raw", "50D/b.cr2", "cr2"),
+            ],
+        )
+        .unwrap();
+        relink_raw_images(&mut conn).unwrap();
+
+        let eligible = list_event_eligible_images(&conn).unwrap();
+        let keys: Vec<&str> = eligible.iter().map(|i| i.key.as_str()).collect();
+        assert!(keys.contains(&"jpg"));
+        assert!(!keys.contains(&"raw"));
+        assert!(keys.contains(&"lonely-raw"));
+    }
+
+    #[test]
+    fn list_images_by_keys_returns_only_the_requested_rows() {
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("a", "a.jpg", "jpg"), image("b", "b.jpg", "jpg"), image("c", "c.jpg", "jpg")])
+            .unwrap();
+
+        let result = list_images_by_keys(&conn, &["a".to_string(), "c".to_string()]).unwrap();
+
+        let keys: Vec<&str> = result.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"a"));
+        assert!(keys.contains(&"c"));
+    }
+
+    #[test]
+    fn list_images_by_keys_returns_empty_for_empty_input() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(list_images_by_keys(&conn, &[]).unwrap().is_empty());
     }
 }

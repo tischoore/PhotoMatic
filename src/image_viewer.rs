@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::thread;
@@ -19,10 +20,15 @@ use crate::keyboard;
 const TOP_ROW_HEIGHT: f32 = 28.0;
 /// Width of the Prev/Next buttons.
 const NAV_BUTTON_WIDTH: f32 = 60.0;
+/// Width of the Toggle RAW button, wider than Prev/Next since its label is longer.
+const TOGGLE_RAW_BUTTON_WIDTH: f32 = 90.0;
 
 /// Opens the Image Viewer on its own thread for one event's photos, starting at `start_index`.
 /// The window's title is a snapshot of `event_title` at open time — unlike an event tab's live
-/// title input, it's never re-synced if the title is edited afterwards.
+/// title input, it's never re-synced if the title is edited afterwards. `linked_images` maps a
+/// displayed photo's own `key` to its linked RAW/compressed counterpart `ImageRecord` (when
+/// "Link RAW and compressed images" has paired it) — the Toggle RAW button's data source, see
+/// `record_to_display`.
 ///
 /// Runs on its own thread rather than a separate process (see `CLAUDE.md`/the design plan):
 /// NWG requires one message loop per thread, so a second *window* already can't share the main
@@ -32,7 +38,13 @@ const NAV_BUTTON_WIDTH: f32 = 60.0;
 /// Rust data, so a thread closure can just take ownership of it — no IPC a separate process
 /// would need is involved. Unlike the Settings dialog, nothing needs to flow back to `App` when
 /// this window closes, so it's fire-and-forget: no `nwg::Notice`/`JoinHandle` bookkeeping.
-pub fn open(event_title: String, images: Vec<ImageRecord>, start_index: usize, source_dir: PathBuf) {
+pub fn open(
+    event_title: String,
+    images: Vec<ImageRecord>,
+    linked_images: HashMap<String, ImageRecord>,
+    start_index: usize,
+    source_dir: PathBuf,
+) {
     thread::spawn(move || {
         // `nwg::ImageDecoder` creates its WIC factory via `CoCreateInstance`, which requires COM
         // initialized on the calling thread. `nwg::init()` (main thread only) initializes COM as
@@ -49,6 +61,7 @@ pub fn open(event_title: String, images: Vec<ImageRecord>, start_index: usize, s
             ImageViewer::build_ui(Default::default()).expect("Failed to build the Image Viewer window");
         viewer.window.set_text(&event_title);
         *viewer.images.borrow_mut() = images;
+        *viewer.linked_images.borrow_mut() = linked_images;
         *viewer.source_dir.borrow_mut() = source_dir;
         *viewer.current_index.borrow_mut() = start_index;
 
@@ -59,8 +72,16 @@ pub fn open(event_title: String, images: Vec<ImageRecord>, start_index: usize, s
 #[derive(Default, NwgUi)]
 pub struct ImageViewer {
     images: RefCell<Vec<ImageRecord>>,
+    /// Every displayed photo's linked RAW/compressed counterpart, keyed by the photo's own
+    /// `key` (`images[i].key`) — populated once at open time by `App::open_image_viewer`. See
+    /// `record_to_display`.
+    linked_images: RefCell<HashMap<String, ImageRecord>>,
     source_dir: RefCell<PathBuf>,
     current_index: RefCell<usize>,
+    /// Whether the Toggle RAW button's counterpart view is active for `current_index`. Reset to
+    /// `false` on every Prev/Next, so a toggled RAW view never silently carries over to the
+    /// next photo.
+    showing_counterpart: RefCell<bool>,
     /// Must be kept alive as long as it's shown — `ImageFrame::set_bitmap` doesn't take
     /// ownership, it just points the control at whatever `Bitmap` is passed in.
     loaded_bitmap: RefCell<Option<nwg::Bitmap>>,
@@ -111,6 +132,14 @@ pub struct ImageViewer {
     #[nwg_control(parent: window, text: "Ne&xt")]
     #[nwg_events(OnButtonClick: [ImageViewer::next])]
     next_button: nwg::Button,
+
+    /// Enabled only when the current photo has a linked RAW/compressed counterpart. A static
+    /// label rather than state-describing text ("Show RAW"/"Show JPG") so its mnemonic never
+    /// needs to change on toggle. No accelerator per `CLAUDE.md`: there's no Windows-standard
+    /// key combination for this action, so none is invented — mnemonic only.
+    #[nwg_control(parent: window, text: "Toggle &RAW")]
+    #[nwg_events(OnButtonClick: [ImageViewer::toggle_raw_compressed])]
+    toggle_raw_button: nwg::Button,
 
     #[nwg_control(parent: window, flags: "VISIBLE", background_color: Some([255, 255, 255]))]
     image_frame: nwg::ImageFrame,
@@ -169,6 +198,8 @@ impl ImageViewer {
             .child_size(Size { width: D::Points(NAV_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .child(&self.next_button)
             .child_size(Size { width: D::Points(NAV_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
+            .child(&self.toggle_raw_button)
+            .child_size(Size { width: D::Points(TOGGLE_RAW_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .build_partial(&self.top_row_layout)
             .expect("Failed to build the Image Viewer's top row layout");
 
@@ -216,6 +247,7 @@ impl ImageViewer {
         }
         *index -= 1;
         drop(index);
+        *self.showing_counterpart.borrow_mut() = false;
         self.show_current_image();
     }
 
@@ -228,6 +260,16 @@ impl ImageViewer {
         }
         *index += 1;
         drop(index);
+        *self.showing_counterpart.borrow_mut() = false;
+        self.show_current_image();
+    }
+
+    /// Toggle RAW's click: flips between the current photo and its linked RAW/compressed
+    /// counterpart (if any — the button is disabled otherwise, see `show_current_image`).
+    fn toggle_raw_compressed(&self) {
+        let mut showing = self.showing_counterpart.borrow_mut();
+        *showing = !*showing;
+        drop(showing);
         self.show_current_image();
     }
 
@@ -241,7 +283,12 @@ impl ImageViewer {
     fn show_current_image(&self) {
         let images = self.images.borrow();
         let index = *self.current_index.borrow();
-        let Some(record) = images.get(index) else { return };
+        let Some(native) = images.get(index) else { return };
+        let linked_images = self.linked_images.borrow();
+        let has_counterpart = linked_images.contains_key(&native.key);
+        let showing_counterpart = *self.showing_counterpart.borrow() && has_counterpart;
+        let Some(record) = record_to_display(&images, &linked_images, index, showing_counterpart) else { return };
+
         let source_dir = self.source_dir.borrow();
         let path = explorer::resolve_path(source_dir.as_path(), &record.path);
 
@@ -258,6 +305,7 @@ impl ImageViewer {
         *self.loaded_bitmap.borrow_mut() = bitmap;
         self.image_frame.set_bitmap(self.loaded_bitmap.borrow().as_ref());
 
+        self.toggle_raw_button.set_enabled(has_counterpart);
         self.prev_button.set_enabled(index > 0);
         self.next_button.set_enabled(index + 1 < images.len());
     }
@@ -288,7 +336,9 @@ impl ImageViewer {
     fn show_metadata(&self) {
         let images = self.images.borrow();
         let index = *self.current_index.borrow();
-        let Some(record) = images.get(index) else { return };
+        let linked_images = self.linked_images.borrow();
+        let showing_counterpart = *self.showing_counterpart.borrow();
+        let Some(record) = record_to_display(&images, &linked_images, index, showing_counterpart) else { return };
         nwg::modal_info_message(&self.window, "Image Metadata", &format_metadata(record));
     }
 
@@ -320,4 +370,70 @@ fn format_metadata(record: &ImageRecord) -> String {
         context_tabs::format_gps_altitude(record.gps_altitude),
         metadata_read_at,
     )
+}
+
+/// The `ImageRecord` `show_current_image`/`show_metadata` should render for `index`: the
+/// linked counterpart from `linked_images` when `showing_counterpart` is set and one exists
+/// for the photo at `index`, otherwise the photo at `index` itself. `None` only when `index`
+/// is out of `images`' bounds. Kept as a free function, independent of NWG's controls/`RefCell`
+/// borrows, so it's unit-testable without a window.
+fn record_to_display<'a>(
+    images: &'a [ImageRecord],
+    linked_images: &'a HashMap<String, ImageRecord>,
+    index: usize,
+    showing_counterpart: bool,
+) -> Option<&'a ImageRecord> {
+    let native = images.get(index)?;
+    if showing_counterpart {
+        Some(linked_images.get(&native.key).unwrap_or(native))
+    } else {
+        Some(native)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(key: &str, path: &str) -> ImageRecord {
+        ImageRecord { key: key.to_string(), path: path.to_string(), image_type: "jpg".to_string(), ..ImageRecord::default() }
+    }
+
+    #[test]
+    fn record_to_display_returns_native_when_not_toggled() {
+        let images = vec![image("a", "a.jpg")];
+        let linked = HashMap::from([("a".to_string(), image("a-raw", "a.cr2"))]);
+
+        let record = record_to_display(&images, &linked, 0, false).unwrap();
+
+        assert_eq!(record.key, "a");
+    }
+
+    #[test]
+    fn record_to_display_returns_counterpart_when_toggled_and_present() {
+        let images = vec![image("a", "a.jpg")];
+        let linked = HashMap::from([("a".to_string(), image("a-raw", "a.cr2"))]);
+
+        let record = record_to_display(&images, &linked, 0, true).unwrap();
+
+        assert_eq!(record.key, "a-raw");
+    }
+
+    #[test]
+    fn record_to_display_falls_back_to_native_when_toggled_but_no_counterpart() {
+        let images = vec![image("a", "a.jpg")];
+        let linked = HashMap::new();
+
+        let record = record_to_display(&images, &linked, 0, true).unwrap();
+
+        assert_eq!(record.key, "a");
+    }
+
+    #[test]
+    fn record_to_display_returns_none_for_out_of_bounds_index() {
+        let images = vec![image("a", "a.jpg")];
+        let linked = HashMap::new();
+
+        assert!(record_to_display(&images, &linked, 5, false).is_none());
+    }
 }

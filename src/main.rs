@@ -14,6 +14,7 @@ mod keyboard;
 mod nav_tree;
 mod panel_background;
 mod project;
+mod raw_linking;
 mod scan;
 mod settings;
 mod settings_modal;

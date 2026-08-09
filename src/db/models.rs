@@ -34,6 +34,10 @@ pub struct ImageRecord {
     /// whether any tag was found). `None` means Generate MetaData hasn't processed
     /// it yet — this is the marker `list_images_pending_metadata` filters on.
     pub metadata_read_at: Option<NaiveDateTime>,
+    /// The `key` of this image's linked RAW/compressed sibling (same directory, same
+    /// filename stem), when "Link RAW and compressed images" has paired it — set on both
+    /// sides of a pair. `None` when unlinked. See `crate::raw_linking::pair_raw_with_compressed`.
+    pub linked_key: Option<String>,
 }
 
 /// A row in the `directories` table.

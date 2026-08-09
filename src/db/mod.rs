@@ -82,9 +82,42 @@ impl ProjectDb {
     }
 
     /// Called once after every `ScanUnit` from a scan has been applied: stamps
-    /// `project_settings.last_scan`.
-    pub fn finish_scan(&self) -> Result<(), DbError> {
-        project_settings::update_last_scan(&self.conn, Utc::now())
+    /// `project_settings.last_scan`, then re-derives RAW/compressed links from scratch —
+    /// relinking everything when `link_raw_images` is enabled, or clearing every link when
+    /// it's disabled. Unconditional either way (not skipped when disabled), so the database's
+    /// link state always matches the current project setting regardless of history.
+    pub fn finish_scan(&mut self, link_raw_images: bool) -> Result<(), DbError> {
+        project_settings::update_last_scan(&self.conn, Utc::now())?;
+        if link_raw_images {
+            images::relink_raw_images(&mut self.conn)
+        } else {
+            images::clear_raw_links(&self.conn)
+        }
+    }
+
+    /// Recomputes every RAW/compressed link immediately — used when the "Link RAW and
+    /// compressed images" checkbox transitions from unchecked to checked for an
+    /// already-scanned project, so it doesn't need a rescan to take effect.
+    pub fn relink_raw_images(&mut self) -> Result<(), DbError> {
+        images::relink_raw_images(&mut self.conn)
+    }
+
+    /// Clears every RAW/compressed link immediately — used when "Link RAW and compressed
+    /// images" is unchecked.
+    pub fn clear_raw_links(&self) -> Result<(), DbError> {
+        images::clear_raw_links(&self.conn)
+    }
+
+    /// The event-eligible image list (excludes a RAW image currently linked to a compressed
+    /// sibling) — backs Generate Events instead of `list_images` when RAW linking is in play.
+    pub fn list_images_for_event_generation(&self) -> Result<Vec<models::ImageRecord>, DbError> {
+        images::list_event_eligible_images(&self.conn)
+    }
+
+    /// Batched lookup by key — used by the Image Viewer to fetch every displayed photo's
+    /// linked counterpart in one query.
+    pub fn list_images_by_keys(&self, keys: &[String]) -> Result<Vec<models::ImageRecord>, DbError> {
+        images::list_images_by_keys(&self.conn, keys)
     }
 
     // The methods below have no GUI caller yet — this phase is backend/schema
@@ -250,7 +283,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), 8);
 
         std::fs::remove_file(&path).ok();
     }
@@ -343,8 +376,36 @@ mod tests {
         apply_units(&mut db, &sample_units());
         assert!(db.project_settings().unwrap().last_scan.is_none());
 
-        db.finish_scan().unwrap();
+        db.finish_scan(false).unwrap();
         assert!(db.project_settings().unwrap().last_scan.is_some());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn finish_scan_relinks_when_enabled_and_clears_when_disabled() {
+        let path = temp_db_path("finish-scan-raw-linking");
+        std::fs::remove_file(&path).ok();
+        let mut db = ProjectDb::open(&path).unwrap();
+
+        apply_units(
+            &mut db,
+            &[ScanUnit::ToplevelDir {
+                name: "50D".to_string(),
+                files: vec![
+                    ScannedFile { relative_path: PathBuf::from("50D").join("a.cr2"), extension: "cr2".to_string(), toplevel_dir: Some("50D".to_string()) },
+                    ScannedFile { relative_path: PathBuf::from("50D").join("a.jpg"), extension: "jpg".to_string(), toplevel_dir: Some("50D".to_string()) },
+                ],
+            }],
+        );
+
+        db.finish_scan(true).unwrap();
+        let images = db.list_images().unwrap();
+        assert!(images.iter().all(|i| i.linked_key.is_some()), "every image should be linked once enabled");
+
+        db.finish_scan(false).unwrap();
+        let images = db.list_images().unwrap();
+        assert!(images.iter().all(|i| i.linked_key.is_none()), "every link should be cleared once disabled");
 
         std::fs::remove_file(&path).ok();
     }
