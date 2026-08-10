@@ -59,6 +59,18 @@ pub fn regenerate(conn: &mut Connection, images: &[ImageRecord], thresholds: &Ev
     tx.commit().map_err(DbError::Sqlite)
 }
 
+/// Removes one image from every event it belongs to — backs the Image Viewer's Delete button.
+/// Any `events` row left with zero remaining `event_images` rows is left as an orphan rather
+/// than cleaned up here: `regenerate` is the only thing that rebuilds `events` from scratch,
+/// and `list_events`'s inner join already excludes a zero-photo event from the views that
+/// matter. The `images` row itself is left untouched, so a later Generate Events run
+/// re-clusters the image if it's still eligible.
+pub fn remove_image_from_all_events(conn: &Connection, image_key: &str) -> Result<(), DbError> {
+    conn.execute("DELETE FROM event_images WHERE image_key = ?1", rusqlite::params![image_key])
+        .map_err(DbError::Sqlite)?;
+    Ok(())
+}
+
 /// Every `events` row with its photo count, ordered chronologically by each event's
 /// earliest photo — backs the Left Navigation tree's Events node. Grouping these into
 /// per-type tree nodes is `event_tree::build`'s job, not this query's; an event with no
@@ -229,6 +241,22 @@ mod tests {
             links,
             vec![(1, "a".to_string()), (1, "b".to_string()), (2, "a".to_string()), (2, "b".to_string())]
         );
+    }
+
+    #[test]
+    fn remove_image_from_all_events_removes_only_that_images_links() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&mut conn).unwrap();
+
+        let images = vec![image_at("a", 10, 0), image_at("b", 10, 30)];
+        seed_images(&mut conn, &images);
+        regenerate(&mut conn, &images, &thresholds()).unwrap();
+
+        remove_image_from_all_events(&conn, "a").unwrap();
+
+        let (events, links) = events_and_links(&conn);
+        assert_eq!(events, vec![(1, "Session".to_string()), (2, "Multi-hour".to_string())]);
+        assert_eq!(links, vec![(1, "b".to_string()), (2, "b".to_string())]);
     }
 
     #[test]

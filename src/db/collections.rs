@@ -203,6 +203,18 @@ pub fn remove_image_from_collection(conn: &Connection, collection_id: i64, image
     Ok(())
 }
 
+/// Removes one image from every collection it belongs to, default collection included — backs
+/// the Image Viewer's Delete button. Unlike `remove_linked_raw_images_from_collections`, this
+/// targets one explicit image key rather than the RAW/linked-key rule, and isn't restricted to
+/// RAW images. The `images` row itself is left untouched, so a later Generate/Update MetaData
+/// run's `INSERT OR IGNORE` (`sync_default_collection`) naturally re-adds the image to the
+/// default collection.
+pub fn remove_image_from_all_collections(conn: &Connection, image_key: &str) -> Result<(), DbError> {
+    conn.execute("DELETE FROM collection_images WHERE image_key = ?1", rusqlite::params![image_key])
+        .map_err(DbError::Sqlite)?;
+    Ok(())
+}
+
 /// Removes every RAW image that currently has a linked compressed counterpart from every
 /// collection it belongs to (not just the default one) — backs checking "Link RAW and
 /// compressed images", so a RAW image whose compressed twin already represents it doesn't
@@ -463,6 +475,33 @@ mod tests {
 
         remove_image_from_collection(&conn, id, "a").unwrap();
         assert!(collection_image_keys(&conn, id).is_empty());
+    }
+
+    #[test]
+    fn remove_image_from_all_collections_removes_it_from_every_collection_including_default() {
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("a", "a.jpg")]).unwrap();
+        let default_id = sync_default_collection(&mut conn, "MyTrip", DEFAULT_COLLECTION_DESCRIPTION).unwrap();
+        let custom_id = create_collection(&conn, "Custom", "", "c").unwrap();
+        add_image_to_collection(&conn, custom_id, "a").unwrap();
+
+        remove_image_from_all_collections(&conn, "a").unwrap();
+
+        assert!(collection_image_keys(&conn, default_id).is_empty());
+        assert!(collection_image_keys(&conn, custom_id).is_empty());
+    }
+
+    #[test]
+    fn remove_image_from_all_collections_leaves_other_images_untouched() {
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("a", "a.jpg"), image("b", "b.jpg")]).unwrap();
+        let id = create_collection(&conn, "Trip A", "First", "a").unwrap();
+        add_image_to_collection(&conn, id, "a").unwrap();
+        add_image_to_collection(&conn, id, "b").unwrap();
+
+        remove_image_from_all_collections(&conn, "a").unwrap();
+
+        assert_eq!(collection_image_keys(&conn, id), vec!["b".to_string()]);
     }
 
     #[test]

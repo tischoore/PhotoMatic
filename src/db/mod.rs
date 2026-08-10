@@ -311,6 +311,17 @@ impl ProjectDb {
     pub fn remove_image_from_collection(&self, collection_id: i64, image_key: &str) -> Result<(), DbError> {
         collections::remove_image_from_collection(&self.conn, collection_id, image_key)
     }
+
+    /// Removes one image from every collection it belongs to, default collection included —
+    /// backs the Image Viewer's Delete button.
+    pub fn remove_image_from_all_collections(&self, image_key: &str) -> Result<(), DbError> {
+        collections::remove_image_from_all_collections(&self.conn, image_key)
+    }
+
+    /// Removes one image from every event it belongs to — backs the Image Viewer's Delete button.
+    pub fn remove_image_from_all_events(&self, image_key: &str) -> Result<(), DbError> {
+        events::remove_image_from_all_events(&self.conn, image_key)
+    }
 }
 
 /// Normalizes a relative path to forward-slash (POSIX) separators, regardless of the

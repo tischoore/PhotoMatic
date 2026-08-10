@@ -6,17 +6,22 @@ pub enum ViewerAction {
     Close,
     Prev,
     Next,
+    Delete,
 }
 
 /// Maps a virtual-key code and Ctrl state to the Image Viewer action it represents (Left/Right
-/// arrows to navigate, Ctrl+W to close, mirroring the Context Window tab convention). Kept
-/// independent of NWG's event system so it can be unit-tested without a window or message loop,
-/// the same way `crate::shortcuts::resolve` is for the main window.
+/// arrows to navigate, Ctrl+W to close, Delete to remove the current photo from every
+/// collection/event, mirroring the Context Window tab convention). Kept independent of NWG's
+/// event system so it can be unit-tested without a window or message loop, the same way
+/// `crate::shortcuts::resolve` is for the main window. Delete is explicitly gated on `!ctrl`
+/// (unlike the ungated Left/Right arms) so a possible future Ctrl+Delete binding is never
+/// silently claimed by this action.
 pub fn resolve(key: u32, ctrl: bool) -> Option<ViewerAction> {
     match key {
         nwg::keys::LEFT => Some(ViewerAction::Prev),
         nwg::keys::RIGHT => Some(ViewerAction::Next),
         nwg::keys::_W if ctrl => Some(ViewerAction::Close),
+        nwg::keys::DELETE if !ctrl => Some(ViewerAction::Delete),
         _ => None,
     }
 }
@@ -71,6 +76,16 @@ mod tests {
     #[test]
     fn plain_w_without_ctrl_does_nothing() {
         assert_eq!(resolve(nwg::keys::_W, false), None);
+    }
+
+    #[test]
+    fn delete_key_without_ctrl_is_delete_action() {
+        assert_eq!(resolve(nwg::keys::DELETE, false), Some(ViewerAction::Delete));
+    }
+
+    #[test]
+    fn ctrl_delete_does_nothing() {
+        assert_eq!(resolve(nwg::keys::DELETE, true), None);
     }
 
     #[test]

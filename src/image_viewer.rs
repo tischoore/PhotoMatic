@@ -31,6 +31,8 @@ const TOP_ROW_HEIGHT: f32 = 28.0;
 const NAV_BUTTON_WIDTH: f32 = 60.0;
 /// Width of the Toggle RAW button, wider than Prev/Next since its label is longer.
 const TOGGLE_RAW_BUTTON_WIDTH: f32 = 90.0;
+/// Width of the Delete button, similar to Toggle RAW.
+const DELETE_BUTTON_WIDTH: f32 = 70.0;
 /// Width of one collection toggle button — just its shortcut letter, so this stays narrow.
 const COLLECTION_BUTTON_WIDTH: f32 = 40.0;
 
@@ -227,6 +229,16 @@ pub struct ImageViewer {
     #[nwg_events(OnButtonClick: [ImageViewer::toggle_raw_compressed])]
     toggle_raw_button: nwg::Button,
 
+    /// Removes the current photo (and its linked RAW/compressed counterpart, if any) from
+    /// every collection and event via `delete_current_image` — the underlying `images` row
+    /// and file on disk are untouched. Mnemonic is `L` (`De&lete`), not `D` — `&Delete` would
+    /// collide with the default collection's fixed `"d"` shortcut, which every project's
+    /// collection row renders as its own `&d`-style mnemonic. Also reachable via the Delete
+    /// key (see `on_key_press`/`image_viewer_shortcuts::ViewerAction::Delete`).
+    #[nwg_control(parent: window, text: "De&lete")]
+    #[nwg_events(OnButtonClick: [ImageViewer::delete_current_image])]
+    delete_button: nwg::Button,
+
     #[nwg_control(parent: window, flags: "VISIBLE", background_color: Some([255, 255, 255]))]
     image_frame: nwg::ImageFrame,
 
@@ -340,6 +352,8 @@ impl ImageViewer {
             .child_size(Size { width: D::Points(NAV_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .child(&self.toggle_raw_button)
             .child_size(Size { width: D::Points(TOGGLE_RAW_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
+            .child(&self.delete_button)
+            .child_size(Size { width: D::Points(DELETE_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .build_partial(&self.top_row_layout)
             .expect("Failed to build the Image Viewer's top row layout");
 
@@ -381,6 +395,7 @@ impl ImageViewer {
             Some(ViewerAction::Close) => return self.close(),
             Some(ViewerAction::Prev) => return self.prev(),
             Some(ViewerAction::Next) => return self.next(),
+            Some(ViewerAction::Delete) => return self.delete_current_image(),
             None => {}
         }
 
@@ -608,6 +623,83 @@ impl ImageViewer {
         self.refresh_collection_buttons(&key);
     }
 
+    /// The Delete button / Delete key: removes the current photo — and, if it has a linked
+    /// RAW/compressed counterpart (`linked_images`), that counterpart too — from every
+    /// collection (including the default one) and every event. The `images` row and the file
+    /// on disk are left untouched, so a later Generate/Update MetaData + Generate Events run
+    /// naturally re-adds it. Confirms first (`nwg::modal_message`, mirroring
+    /// `App::delete_selected_collection`), since this can't be undone within the session
+    /// without closing and reopening the viewer. Acts on the *native* record at
+    /// `current_index` regardless of whether Toggle RAW is currently showing the counterpart,
+    /// so a delete always targets the pair anchored to the current navigation slot.
+    fn delete_current_image(&self) {
+        let index = *self.current_index.borrow();
+        let native_key = {
+            let images = self.images.borrow();
+            let Some(record) = images.get(index) else { return };
+            record.key.clone()
+        };
+        let counterpart_key = self.linked_images.borrow().get(&native_key).map(|r| r.key.clone());
+
+        let choice = nwg::modal_message(
+            &self.window,
+            &nwg::MessageParams {
+                title: "PhotoMatic",
+                content: "Remove this photo from every collection and event? The image file \
+                          itself and its database record are not deleted, and it will \
+                          reappear after the next Generate/Update MetaData and Generate \
+                          Events run.",
+                buttons: nwg::MessageButtons::YesNo,
+                icons: nwg::MessageIcons::Warning,
+            },
+        );
+        if choice != nwg::MessageChoice::Yes {
+            return;
+        }
+
+        let db_path = self.db_path.borrow().clone();
+        let db = match db::ProjectDb::open(&db_path) {
+            Ok(db) => db,
+            Err(err) => {
+                nwg::simple_message("PhotoMatic", &format!("Failed to open the database: {err}"));
+                return;
+            }
+        };
+        let result = (|| -> Result<(), db::DbError> {
+            db.remove_image_from_all_collections(&native_key)?;
+            db.remove_image_from_all_events(&native_key)?;
+            if let Some(key) = &counterpart_key {
+                db.remove_image_from_all_collections(key)?;
+                db.remove_image_from_all_events(key)?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            nwg::simple_message("PhotoMatic", &format!("Failed to delete image: {err}"));
+            return;
+        }
+
+        self.membership.borrow_mut().remove(&native_key);
+        self.linked_images.borrow_mut().remove(&native_key);
+        if let Some(key) = &counterpart_key {
+            self.membership.borrow_mut().remove(key);
+        }
+
+        let old_len = {
+            let mut images = self.images.borrow_mut();
+            let old_len = images.len();
+            images.remove(index);
+            old_len
+        };
+
+        let Some(new_index) = index_after_removal(index, old_len) else { return self.close() };
+        *self.current_index.borrow_mut() = new_index;
+        *self.showing_counterpart.borrow_mut() = false;
+        self.image_cache.borrow_mut().clear();
+        self.prefetch_in_flight.borrow_mut().clear();
+        self.show_current_image();
+    }
+
     /// Edit > Meta Data...: every database field for the current photo, in a dialog locked to
     /// this window (`nwg::modal_info_message`, unlike `nwg::simple_message`, takes a parent and
     /// disables it for the duration — a genuine modal). All of it is already sitting in the
@@ -738,6 +830,22 @@ fn record_to_display<'a>(
     }
 }
 
+/// The index `delete_current_image` should select after removing `removed_index` from a list
+/// that had `old_len` items — stays at `removed_index` (now pointing at what was the next
+/// item) unless that was the last item, in which case it steps back to the new last item.
+/// `None` when the list is now empty (the caller should close the window instead). Kept as a
+/// free function so this arithmetic is unit-testable without a window or database.
+fn index_after_removal(removed_index: usize, old_len: usize) -> Option<usize> {
+    let new_len = old_len.saturating_sub(1);
+    if new_len == 0 {
+        None
+    } else if removed_index >= new_len {
+        Some(new_len - 1)
+    } else {
+        Some(removed_index)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,6 +890,21 @@ mod tests {
         let linked = HashMap::new();
 
         assert!(record_to_display(&images, &linked, 5, false).is_none());
+    }
+
+    #[test]
+    fn index_after_removal_advances_to_next_when_not_last() {
+        assert_eq!(index_after_removal(2, 5), Some(2));
+    }
+
+    #[test]
+    fn index_after_removal_steps_back_when_last_was_removed() {
+        assert_eq!(index_after_removal(4, 5), Some(3));
+    }
+
+    #[test]
+    fn index_after_removal_is_none_when_list_becomes_empty() {
+        assert_eq!(index_after_removal(0, 1), None);
     }
 
     #[test]
