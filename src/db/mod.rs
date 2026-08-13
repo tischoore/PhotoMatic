@@ -312,6 +312,12 @@ impl ProjectDb {
         collections::remove_image_from_collection(&self.conn, collection_id, image_key)
     }
 
+    /// Writes one image's rotation (degrees clockwise) — the Image Viewer's Rotate button
+    /// (Alt+R).
+    pub fn set_image_rotation(&self, key: &str, rotation: i32) -> Result<(), DbError> {
+        images::set_rotation(&self.conn, key, rotation)
+    }
+
     /// Removes one image from every collection it belongs to, default collection included —
     /// backs the Image Viewer's Delete button.
     pub fn remove_image_from_all_collections(&self, image_key: &str) -> Result<(), DbError> {
@@ -392,7 +398,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 10);
+        assert_eq!(db.schema_version().unwrap(), 11);
 
         std::fs::remove_file(&path).ok();
     }

@@ -38,6 +38,9 @@ pub struct ImageRecord {
     /// filename stem), when "Link RAW and compressed images" has paired it — set on both
     /// sides of a pair. `None` when unlinked. See `crate::raw_linking::pair_raw_with_compressed`.
     pub linked_key: Option<String>,
+    /// Degrees clockwise (0/90/180/270) the Image Viewer's Rotate button has rotated this
+    /// photo, wrapping back to 0 past 270. `None` means no rotation has ever been applied.
+    pub rotation: Option<i32>,
 }
 
 /// A row in the `directories` table.

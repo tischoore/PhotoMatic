@@ -36,7 +36,8 @@ pub fn upsert_images(conn: &mut Connection, images: &[ImageRecord]) -> Result<()
 /// event's photo table can be built with the same column set/order as every other
 /// `ImageRecord` query, without duplicating it.
 pub(super) const IMAGE_COLUMNS: &str = "key, path, image_type, toplevel_dir, date_taken, width, height, \
-     exposure_time, iso, focal_length, gps_latitude, gps_longitude, gps_altitude, metadata_read_at, linked_key";
+     exposure_time, iso, focal_length, gps_latitude, gps_longitude, gps_altitude, metadata_read_at, linked_key, \
+     rotation";
 
 pub(super) fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord> {
     Ok(ImageRecord {
@@ -55,6 +56,7 @@ pub(super) fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord
         gps_altitude: row.get(12)?,
         metadata_read_at: row.get(13)?,
         linked_key: row.get(14)?,
+        rotation: row.get(15)?,
     })
 }
 
@@ -169,6 +171,14 @@ pub fn relink_raw_images(conn: &mut Connection) -> Result<(), DbError> {
 /// Clears every `linked_key` immediately — backs unchecking "Link RAW and compressed images".
 pub fn clear_raw_links(conn: &Connection) -> Result<(), DbError> {
     conn.execute("UPDATE images SET linked_key = NULL", []).map_err(DbError::Sqlite)?;
+    Ok(())
+}
+
+/// Writes the current photo's rotation (degrees clockwise, 0/90/180/270) — backs the Image
+/// Viewer's Rotate button (Alt+R).
+pub fn set_rotation(conn: &Connection, key: &str, rotation: i32) -> Result<(), DbError> {
+    conn.execute("UPDATE images SET rotation = ?2 WHERE key = ?1", rusqlite::params![key, rotation])
+        .map_err(DbError::Sqlite)?;
     Ok(())
 }
 
@@ -325,5 +335,16 @@ mod tests {
     fn list_images_by_keys_returns_empty_for_empty_input() {
         let conn = Connection::open_in_memory().unwrap();
         assert!(list_images_by_keys(&conn, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_rotation_round_trips_through_list_images() {
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("a", "a.jpg", "jpg")]).unwrap();
+        assert_eq!(list_images(&conn).unwrap()[0].rotation, None);
+
+        set_rotation(&conn, "a", 90).unwrap();
+
+        assert_eq!(list_images(&conn).unwrap()[0].rotation, Some(90));
     }
 }

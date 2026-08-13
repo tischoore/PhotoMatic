@@ -110,6 +110,7 @@ mod tests {
             gps_altitude: Some(123.4),
             metadata_read_at: None,
             linked_key: None,
+            rotation: None,
         };
         assert_eq!(
             image_row(&record),
@@ -145,6 +146,7 @@ mod tests {
             gps_altitude: None,
             metadata_read_at: None,
             linked_key: None,
+            rotation: None,
         };
         assert_eq!(
             image_row(&record),

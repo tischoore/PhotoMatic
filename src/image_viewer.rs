@@ -33,6 +33,8 @@ const NAV_BUTTON_WIDTH: f32 = 60.0;
 const TOGGLE_RAW_BUTTON_WIDTH: f32 = 90.0;
 /// Width of the Delete button, similar to Toggle RAW.
 const DELETE_BUTTON_WIDTH: f32 = 70.0;
+/// Width of the Rotate button, similar to Delete.
+const ROTATE_BUTTON_WIDTH: f32 = 70.0;
 /// Width of one collection toggle button — just its shortcut letter, so this stays narrow.
 const COLLECTION_BUTTON_WIDTH: f32 = 40.0;
 
@@ -224,8 +226,9 @@ pub struct ImageViewer {
     /// Enabled only when the current photo has a linked RAW/compressed counterpart. A static
     /// label rather than state-describing text ("Show RAW"/"Show JPG") so its mnemonic never
     /// needs to change on toggle. No accelerator per `CLAUDE.md`: there's no Windows-standard
-    /// key combination for this action, so none is invented — mnemonic only.
-    #[nwg_control(parent: window, text: "Toggle &RAW")]
+    /// key combination for this action, so none is invented — mnemonic only. Mnemonic is `W`
+    /// (`Toggle RA&W`), not `R` — `R` is reserved for the Rotate button's Alt+R below.
+    #[nwg_control(parent: window, text: "Toggle RA&W")]
     #[nwg_events(OnButtonClick: [ImageViewer::toggle_raw_compressed])]
     toggle_raw_button: nwg::Button,
 
@@ -238,6 +241,15 @@ pub struct ImageViewer {
     #[nwg_control(parent: window, text: "De&lete")]
     #[nwg_events(OnButtonClick: [ImageViewer::delete_current_image])]
     delete_button: nwg::Button,
+
+    /// Rotates the current photo 90° clockwise, wrapping past 270° back to 0°, and persists
+    /// the new value to the database (`rotate_current_image`). No accelerator per `CLAUDE.md`
+    /// beyond the mnemonic itself — Alt+R has no Windows-standard meaning, so this is exactly
+    /// the same "native mnemonic, no custom key handling" mechanism every other button here
+    /// uses, not a custom-wired shortcut.
+    #[nwg_control(parent: window, text: "&Rotate")]
+    #[nwg_events(OnButtonClick: [ImageViewer::rotate_current_image])]
+    rotate_button: nwg::Button,
 
     #[nwg_control(parent: window, flags: "VISIBLE", background_color: Some([255, 255, 255]))]
     image_frame: nwg::ImageFrame,
@@ -354,6 +366,8 @@ impl ImageViewer {
             .child_size(Size { width: D::Points(TOGGLE_RAW_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .child(&self.delete_button)
             .child_size(Size { width: D::Points(DELETE_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
+            .child(&self.rotate_button)
+            .child_size(Size { width: D::Points(ROTATE_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .build_partial(&self.top_row_layout)
             .expect("Failed to build the Image Viewer's top row layout");
 
@@ -473,7 +487,8 @@ impl ImageViewer {
 
         let mut cache = self.image_cache.borrow_mut();
         if cache.get(cache_key).is_none() {
-            if let Some(bitmap) = decode_and_fit(&self.decoder, &path, frame_size) {
+            let rotation_degrees = record.rotation.unwrap_or(0);
+            if let Some(bitmap) = decode_and_fit(&self.decoder, &path, frame_size, rotation_degrees) {
                 cache.insert(cache_key, bitmap);
             }
         }
@@ -521,6 +536,7 @@ impl ImageViewer {
 
             let Some(record) = self.images.borrow().get(index).cloned() else { continue };
             let path = explorer::resolve_path(self.source_dir.borrow().as_path(), &record.path);
+            let rotation_degrees = record.rotation.unwrap_or(0);
             let tx = tx.clone();
             let notice = self.prefetch_notice.sender();
 
@@ -537,7 +553,7 @@ impl ImageViewer {
                 // is a COM object bound to the thread that created it, so it can't be shared
                 // with a background thread's own apartment.
                 if let Ok(decoder) = nwg::ImageDecoder::new() {
-                    if let Some(bitmap) = decode_and_fit(&decoder, &path, frame_size) {
+                    if let Some(bitmap) = decode_and_fit(&decoder, &path, frame_size, rotation_degrees) {
                         let _ = tx.send(PrefetchResult { index, frame_size, bitmap: SendBitmap(bitmap) });
                         notice.notice();
                     }
@@ -621,6 +637,50 @@ impl ImageViewer {
         }
 
         self.refresh_collection_buttons(&key);
+    }
+
+    /// The Rotate button / Alt+R: rotates the currently displayed photo (native or, if Toggle
+    /// RAW is active, its counterpart — via `record_to_display`, since rotation is a property
+    /// of that specific `key`) 90° clockwise, wrapping past 270° back to 0° (`next_rotation`).
+    /// Persists to the database via a fresh, short-lived connection to `db_path` — same pattern
+    /// as `toggle_collection` — then updates whichever in-memory record holds that key (it may
+    /// be a plain `images` entry or a `linked_images` counterpart) and redraws. Every
+    /// cached/in-flight bitmap was fit *and rotated* for the old value, so both are dropped
+    /// first, same as `delete_current_image`/`on_resize`.
+    fn rotate_current_image(&self) {
+        let index = *self.current_index.borrow();
+        let showing_counterpart = *self.showing_counterpart.borrow();
+
+        let (key, new_rotation) = {
+            let images = self.images.borrow();
+            let linked_images = self.linked_images.borrow();
+            let Some(record) = record_to_display(&images, &linked_images, index, showing_counterpart) else { return };
+            (record.key.clone(), next_rotation(record.rotation))
+        };
+
+        let db_path = self.db_path.borrow().clone();
+        let db = match db::ProjectDb::open(&db_path) {
+            Ok(db) => db,
+            Err(err) => {
+                nwg::simple_message("PhotoMatic", &format!("Failed to open the database: {err}"));
+                return;
+            }
+        };
+        if let Err(err) = db.set_image_rotation(&key, new_rotation) {
+            nwg::simple_message("PhotoMatic", &format!("Failed to save rotation: {err}"));
+            return;
+        }
+
+        if let Some(record) = self.images.borrow_mut().iter_mut().find(|r| r.key == key) {
+            record.rotation = Some(new_rotation);
+        }
+        if let Some(record) = self.linked_images.borrow_mut().values_mut().find(|r| r.key == key) {
+            record.rotation = Some(new_rotation);
+        }
+
+        self.image_cache.borrow_mut().clear();
+        self.prefetch_in_flight.borrow_mut().clear();
+        self.show_current_image();
     }
 
     /// The Delete button / Delete key: removes the current photo — and, if it has a linked
@@ -736,17 +796,107 @@ struct PrefetchResult {
 struct SendBitmap(nwg::Bitmap);
 unsafe impl Send for SendBitmap {}
 
-/// Decodes `path` and scales it to fit inside `frame_size`, preserving aspect ratio — the
-/// synchronous path in `show_current_image` and every `schedule_prefetch` background thread both
-/// go through this, each with their own `nwg::ImageDecoder` (an `ImageDecoder`'s WIC factory is a
-/// COM object bound to whichever thread created it, so a background thread can't reuse the
-/// viewer's own).
-fn decode_and_fit(decoder: &nwg::ImageDecoder, path: &Path, frame_size: (u32, u32)) -> Option<nwg::Bitmap> {
+/// Decodes `path`, scales it to fit inside `frame_size` preserving aspect ratio, then rotates
+/// the *already-scaled* result `rotation_degrees` clockwise (0/90/180/270 — the current photo's
+/// `ImageRecord::rotation`) — the synchronous path in `show_current_image` and every
+/// `schedule_prefetch` background thread both go through this, each with their own
+/// `nwg::ImageDecoder` (an `ImageDecoder`'s WIC factory is a COM object bound to whichever
+/// thread created it, so a background thread can't reuse the viewer's own).
+///
+/// Scaling happens *before* rotating, not after, even though that means computing the fit
+/// target against a width/height-swapped `frame_size` (via `swapped_for_rotation`) for a
+/// 90°/270° rotation — and the scaled result is then *materialized* into real memory
+/// (`materialize_bitmap`) before rotating it, rather than rotating the still-lazy scaler chain
+/// directly. Both steps were forced by direct measurement, not just theory:
+///
+/// - Rotating the full-resolution decoded frame first, then scaling it down, took **14.5
+///   seconds** in `as_bitmap()` alone for a 3000×2000 test photo (a real DSLR photo would be far
+///   worse — reads as a hung window). This is a known WIC pitfall: `IWICBitmapFlipRotator`
+///   wrapped directly around a JPEG decoder frame needs column-major access, but JPEG decoding
+///   is row-sequential, so satisfying a 90°/270° rotation's `CopyPixels` call forces large
+///   amounts of redundant re-decoding. Scaling first (mathematically identical for a 90°
+///   multiple, since rotation commutes with uniform scaling) cuts the *source* resolution the
+///   rotator has to fight with, but only to **2.4 seconds** — still the same underlying problem,
+///   one layer down: the rotator now sits directly on the still-lazy `IWICBitmapScaler`, which
+///   itself still has to consult the row-sequential JPEG decoder to answer the rotator's
+///   column-major requests.
+/// - Materializing the scaled result into a real, randomly-accessible `IWICBitmap` first (rather
+///   than leaving it as a lazy scaler chain) fixes this at the source: the rotator then reads
+///   from an actual pixel buffer, not a decoder, regardless of access pattern.
+fn decode_and_fit(decoder: &nwg::ImageDecoder, path: &Path, frame_size: (u32, u32), rotation_degrees: i32) -> Option<nwg::Bitmap> {
     let source = decoder.from_filename(&path.to_string_lossy()).ok()?;
     let frame = source.frame(0).ok()?;
-    match fitted_target_size(frame_size, frame.size()) {
-        Some(target) => decoder.resize_image(&frame, target).ok()?.as_bitmap().ok(),
-        None => frame.as_bitmap().ok(),
+    let fit_target_size = swapped_for_rotation(frame_size, rotation_degrees);
+    let scaled = match fitted_target_size(fit_target_size, frame.size()) {
+        Some(target) => decoder.resize_image(&frame, target).ok()?,
+        None => frame,
+    };
+    let scaled = materialize_bitmap(decoder, &scaled)?;
+    let rotated = rotate_frame(decoder, &scaled, rotation_degrees)?;
+    rotated.as_bitmap().ok()
+}
+
+/// Forces `source` into a real, randomly-accessible in-memory `IWICBitmap` (via
+/// `IWICImagingFactory::CreateBitmapFromSource`), rather than leaving it as a lazy chain of WIC
+/// filters — see `decode_and_fit`'s doc comment for why this matters: `rotate_frame`'s
+/// `IWICBitmapFlipRotator` needs efficient column-major reads, which only a materialized bitmap
+/// (not a decoder or scaler still consulting one) can give it cheaply.
+fn materialize_bitmap(decoder: &nwg::ImageDecoder, source: &nwg::ImageData) -> Option<nwg::ImageData> {
+    use winapi::shared::winerror::S_OK;
+    use winapi::um::wincodec::{IWICBitmap, IWICBitmapSource, IWICImagingFactory, WICBitmapCacheOnLoad};
+
+    unsafe {
+        let factory = &*(decoder.factory as *const IWICImagingFactory);
+        let mut bitmap: *mut IWICBitmap = std::ptr::null_mut();
+        if factory.CreateBitmapFromSource(source.frame as *const IWICBitmapSource, WICBitmapCacheOnLoad, &mut bitmap) != S_OK {
+            return None;
+        }
+        Some(nwg::ImageData { frame: bitmap as *mut IWICBitmapSource })
+    }
+}
+
+/// `size` with its components swapped when `rotation_degrees` is 90 or 270 (which swap width
+/// and height), unchanged otherwise — used to fit an image *before* rotating it against a
+/// target that accounts for the rotation to come. Kept as a free function, independent of WIC,
+/// so it's unit-testable without either.
+fn swapped_for_rotation(size: (u32, u32), rotation_degrees: i32) -> (u32, u32) {
+    match rotation_degrees {
+        90 | 270 => (size.1, size.0),
+        _ => size,
+    }
+}
+
+/// Rotates `frame` clockwise by `rotation_degrees` (0/90/180/270) via WIC's
+/// `IWICBitmapFlipRotator` — the same "wrap a WIC bitmap source, hand the wrapper back as a
+/// plain `ImageData`" technique `nwg::ImageDecoder::resize_image` uses internally for scaling
+/// (via `IWICBitmapScaler`). `nwg` has no rotate API of its own, so this reaches one level below
+/// it: `nwg::ImageData::frame` and `nwg::ImageDecoder::factory` are `pub` fields specifically
+/// enabling this kind of extension. `None` on any WIC failure, which the caller treats the same
+/// as a decode failure (leaves the image blank, "preview unavailable").
+fn rotate_frame(decoder: &nwg::ImageDecoder, frame: &nwg::ImageData, rotation_degrees: i32) -> Option<nwg::ImageData> {
+    use winapi::shared::winerror::S_OK;
+    use winapi::um::wincodec::{
+        IWICBitmapFlipRotator, IWICBitmapSource, IWICImagingFactory, WICBitmapTransformRotate0,
+        WICBitmapTransformRotate90, WICBitmapTransformRotate180, WICBitmapTransformRotate270,
+    };
+
+    let option = match rotation_degrees {
+        90 => WICBitmapTransformRotate90,
+        180 => WICBitmapTransformRotate180,
+        270 => WICBitmapTransformRotate270,
+        _ => WICBitmapTransformRotate0,
+    };
+
+    unsafe {
+        let factory = &*(decoder.factory as *const IWICImagingFactory);
+        let mut rotator: *mut IWICBitmapFlipRotator = std::ptr::null_mut();
+        if factory.CreateBitmapFlipRotator(&mut rotator) != S_OK {
+            return None;
+        }
+        if (&*rotator).Initialize(frame.frame as *const IWICBitmapSource, option) != S_OK {
+            return None;
+        }
+        Some(nwg::ImageData { frame: rotator as *mut IWICBitmapSource })
     }
 }
 
@@ -846,6 +996,14 @@ fn index_after_removal(removed_index: usize, old_len: usize) -> Option<usize> {
     }
 }
 
+/// The rotation (degrees clockwise) after rotating `current` 90° further, wrapping past 270°
+/// back to 0° — the Rotate button/Alt+R's core arithmetic. `None` (no rotation recorded yet) is
+/// treated as 0°. Kept as a free function, independent of the database or WIC, so it's
+/// unit-testable without either.
+fn next_rotation(current: Option<i32>) -> i32 {
+    (current.unwrap_or(0) + 90) % 360
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,6 +1063,34 @@ mod tests {
     #[test]
     fn index_after_removal_is_none_when_list_becomes_empty() {
         assert_eq!(index_after_removal(0, 1), None);
+    }
+
+    #[test]
+    fn next_rotation_from_none_is_90() {
+        assert_eq!(next_rotation(None), 90);
+    }
+
+    #[test]
+    fn next_rotation_advances_by_90() {
+        assert_eq!(next_rotation(Some(90)), 180);
+        assert_eq!(next_rotation(Some(180)), 270);
+    }
+
+    #[test]
+    fn next_rotation_wraps_from_270_to_0() {
+        assert_eq!(next_rotation(Some(270)), 0);
+    }
+
+    #[test]
+    fn swapped_for_rotation_swaps_for_a_quarter_turn() {
+        assert_eq!(swapped_for_rotation((1000, 750), 90), (750, 1000));
+        assert_eq!(swapped_for_rotation((1000, 750), 270), (750, 1000));
+    }
+
+    #[test]
+    fn swapped_for_rotation_leaves_size_unchanged_for_0_or_180() {
+        assert_eq!(swapped_for_rotation((1000, 750), 0), (1000, 750));
+        assert_eq!(swapped_for_rotation((1000, 750), 180), (1000, 750));
     }
 
     #[test]
