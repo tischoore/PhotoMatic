@@ -11,6 +11,7 @@ use nwg::stretch::geometry::Size;
 use nwg::stretch::style::{Dimension as D, FlexDirection};
 use nwg::NativeUi;
 
+use crate::color_correction;
 use crate::context_tabs;
 use crate::db;
 use crate::db::models::{CollectionRecord, ImageRecord};
@@ -35,6 +36,8 @@ const TOGGLE_RAW_BUTTON_WIDTH: f32 = 90.0;
 const DELETE_BUTTON_WIDTH: f32 = 70.0;
 /// Width of the Rotate button, similar to Delete.
 const ROTATE_BUTTON_WIDTH: f32 = 70.0;
+/// Width of the Auto Correct button, wider than Rotate since its label is longer.
+const AUTO_CORRECT_BUTTON_WIDTH: f32 = 100.0;
 /// Width of one collection toggle button — just its shortcut letter, so this stays narrow.
 const COLLECTION_BUTTON_WIDTH: f32 = 40.0;
 
@@ -153,6 +156,16 @@ pub struct ImageViewer {
     prefetch_tx: RefCell<Option<mpsc::Sender<PrefetchResult>>>,
     /// Receiving half of the same channel, drained by `apply_prefetch_results` on `OnNotice`.
     prefetch_rx: RefCell<Option<mpsc::Receiver<PrefetchResult>>>,
+    /// The key of the photo `toggle_auto_correct`'s background thread is currently computing a
+    /// correction for, if any — `None` when nothing is in flight. Per-key rather than a bool so
+    /// navigating to a different photo while one computation is still running doesn't leave
+    /// *that* photo's checkbox incorrectly disabled; see `refresh_auto_correct_button`.
+    auto_correct_in_flight: RefCell<Option<String>>,
+    /// Sending half of the auto-correct result channel, cloned into every
+    /// `toggle_auto_correct` background thread. `None` until `setup` creates the channel.
+    auto_correct_tx: RefCell<Option<mpsc::Sender<AutoCorrectResult>>>,
+    /// Receiving half of the same channel, drained by `apply_auto_correct_results` on `OnNotice`.
+    auto_correct_rx: RefCell<Option<mpsc::Receiver<AutoCorrectResult>>>,
     /// Keeps the `OnKeyPress`/`OnButtonClick` subclass hook from `setup` alive for the
     /// window's lifetime. See that method's doc comment for why a plain
     /// `#[nwg_events(OnKeyPress: ...)]` on `window` wouldn't be enough.
@@ -201,6 +214,13 @@ pub struct ImageViewer {
     #[nwg_control]
     #[nwg_events(OnNotice: [ImageViewer::apply_prefetch_results])]
     prefetch_notice: nwg::Notice,
+
+    /// Fires once per `toggle_auto_correct` background computation that lands — see
+    /// `apply_auto_correct_results`. Same "declared after `window`" requirement as
+    /// `prefetch_notice` above.
+    #[nwg_control]
+    #[nwg_events(OnNotice: [ImageViewer::apply_auto_correct_results])]
+    auto_correct_notice: nwg::Notice,
 
     #[nwg_control(parent: window, text: "&File")]
     file_menu: nwg::Menu,
@@ -262,6 +282,20 @@ pub struct ImageViewer {
     #[nwg_events(OnButtonClick: [ImageViewer::rotate_current_image])]
     rotate_button: nwg::Button,
 
+    /// A push-button-style toggle (`BS_PUSHLIKE`, so it visually stays depressed while checked,
+    /// rather than the plain-checkbox look the collection buttons below use) for the current
+    /// photo's Simplest Color Balance brightness/contrast correction. Checking it computes and
+    /// persists a correction non-destructively, the same way Rotate persists rotation — except on
+    /// a background thread, since accurate clip points need a full-resolution decode, which
+    /// `decode_and_fit`'s own doc comment measured at up to several seconds for a real photo.
+    /// Unchecking it deletes the stored correction immediately (`toggle_auto_correct`,
+    /// `clear_auto_correct`). No accelerator per `CLAUDE.md`: no Windows-standard key combination
+    /// exists for this action, so mnemonic only, matching every other control in this row.
+    /// Mnemonic is `C` (`Auto &Correct`) — free: this row's other mnemonics are P/X/W/L/R.
+    #[nwg_control(parent: window, text: "Auto &Correct", flags: "VISIBLE|TAB_STOP|PUSHLIKE", check_state: nwg::CheckBoxState::Unchecked)]
+    #[nwg_events(OnButtonClick: [ImageViewer::toggle_auto_correct])]
+    auto_correct_button: nwg::CheckBox,
+
     #[nwg_control(parent: window, flags: "VISIBLE", background_color: Some([255, 255, 255]))]
     image_frame: nwg::ImageFrame,
 
@@ -296,6 +330,10 @@ impl ImageViewer {
         let (tx, rx) = mpsc::channel();
         *app.prefetch_tx.borrow_mut() = Some(tx);
         *app.prefetch_rx.borrow_mut() = Some(rx);
+
+        let (auto_correct_tx, auto_correct_rx) = mpsc::channel();
+        *app.auto_correct_tx.borrow_mut() = Some(auto_correct_tx);
+        *app.auto_correct_rx.borrow_mut() = Some(auto_correct_rx);
 
         // One shared hook for both `OnKeyPress` (Left/Right/Ctrl+W, see this method's doc
         // comment above) and `OnButtonClick` on the collection toggle buttons — the latter are
@@ -379,6 +417,8 @@ impl ImageViewer {
             .child_size(Size { width: D::Points(DELETE_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .child(&self.rotate_button)
             .child_size(Size { width: D::Points(ROTATE_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
+            .child(&self.auto_correct_button)
+            .child_size(Size { width: D::Points(AUTO_CORRECT_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .build_partial(&self.top_row_layout)
             .expect("Failed to build the Image Viewer's top row layout");
 
@@ -499,7 +539,8 @@ impl ImageViewer {
         let mut cache = self.image_cache.borrow_mut();
         if cache.get(cache_key).is_none() {
             let rotation_degrees = record.rotation.unwrap_or(0);
-            if let Some(bitmap) = decode_and_fit(&self.decoder, &path, frame_size, rotation_degrees) {
+            let color_params = color_correction::from_record(record);
+            if let Some(bitmap) = decode_and_fit(&self.decoder, &path, frame_size, rotation_degrees, color_params.as_ref()) {
                 cache.insert(cache_key, bitmap);
             }
         }
@@ -514,6 +555,7 @@ impl ImageViewer {
         self.prev_button.set_enabled(index > 0);
         self.next_button.set_enabled(index + 1 < images.len());
         self.refresh_collection_buttons(&record.key);
+        self.refresh_auto_correct_button(record);
 
         drop(source_dir);
         drop(linked_images);
@@ -567,6 +609,7 @@ impl ImageViewer {
             let Some(record) = self.images.borrow().get(index).cloned() else { continue };
             let path = explorer::resolve_path(self.source_dir.borrow().as_path(), &record.path);
             let rotation_degrees = record.rotation.unwrap_or(0);
+            let color_params = color_correction::from_record(&record);
             let tx = tx.clone();
             let notice = self.prefetch_notice.sender();
 
@@ -583,7 +626,7 @@ impl ImageViewer {
                 // is a COM object bound to the thread that created it, so it can't be shared
                 // with a background thread's own apartment.
                 if let Ok(decoder) = nwg::ImageDecoder::new() {
-                    if let Some(bitmap) = decode_and_fit(&decoder, &path, frame_size, rotation_degrees) {
+                    if let Some(bitmap) = decode_and_fit(&decoder, &path, frame_size, rotation_degrees, color_params.as_ref()) {
                         let _ = tx.send(PrefetchResult { index, frame_size, bitmap: SendBitmap(bitmap) });
                         notice.notice();
                     }
@@ -713,6 +756,188 @@ impl ImageViewer {
         self.show_current_image();
     }
 
+    /// Sets the Auto Correct checkbox's checked state from whether `record` currently has a
+    /// stored correction (`color_correction::from_record`), and its enabled state from whether a
+    /// background computation is currently running for *this* record's key
+    /// (`auto_correct_in_flight`) — called from `show_current_image`, so Prev/Next, Toggle RAW,
+    /// and a landed/failed background result (via `apply_auto_correct_results`'s own call into
+    /// `show_current_image`) all keep it in sync automatically.
+    fn refresh_auto_correct_button(&self, record: &ImageRecord) {
+        let checked = color_correction::from_record(record).is_some();
+        self.auto_correct_button.set_check_state(if checked { nwg::CheckBoxState::Checked } else { nwg::CheckBoxState::Unchecked });
+        let computing = self.auto_correct_in_flight.borrow().as_deref() == Some(record.key.as_str());
+        self.auto_correct_button.set_enabled(!computing);
+    }
+
+    /// The Auto Correct checkbox: checking it computes a Simplest Color Balance
+    /// brightness/contrast correction for the currently displayed photo (native or, if Toggle RAW
+    /// is active, its counterpart — via `record_to_display`, same as `rotate_current_image`) and
+    /// persists it non-destructively; unchecking it deletes the stored correction immediately
+    /// (`clear_auto_correct`). The checked path runs on a background thread rather than
+    /// synchronously, since accurate clip points need a full-resolution decode + pixel pass,
+    /// which `decode_and_fit`'s own doc comment measured at up to several seconds for a real
+    /// photo; freezing the UI for that long is unacceptable. Mirrors `schedule_prefetch`'s
+    /// background-thread + channel + `Notice` pattern instead of Rotate's synchronous one.
+    /// `check_state()` here reads the checkbox's *already-toggled* new state — the same
+    /// assumption `app.rs::sync_file_extensions_from_checkboxes` relies on for its own checkboxes.
+    fn toggle_auto_correct(&self) {
+        let index = *self.current_index.borrow();
+        let showing_counterpart = *self.showing_counterpart.borrow();
+        let (key, path) = {
+            let images = self.images.borrow();
+            let linked_images = self.linked_images.borrow();
+            let Some(record) = record_to_display(&images, &linked_images, index, showing_counterpart) else { return };
+            let source_dir = self.source_dir.borrow();
+            (record.key.clone(), explorer::resolve_path(source_dir.as_path(), &record.path))
+        };
+
+        if self.auto_correct_button.check_state() != nwg::CheckBoxState::Checked {
+            self.clear_auto_correct(&key);
+            return;
+        }
+
+        // Belt-and-suspenders: the checkbox is disabled while in flight for this key, so
+        // `OnButtonClick` shouldn't fire again for it anyway.
+        if self.auto_correct_in_flight.borrow().as_deref() == Some(key.as_str()) {
+            return;
+        }
+
+        let Some(tx) = self.auto_correct_tx.borrow().clone() else { return };
+        let notice = self.auto_correct_notice.sender();
+
+        *self.auto_correct_in_flight.borrow_mut() = Some(key.clone());
+        self.auto_correct_button.set_enabled(false);
+
+        thread::spawn(move || {
+            // Same reasoning as `schedule_prefetch`'s thread: WIC decoding needs COM initialized
+            // on the calling thread, and a fresh `ImageDecoder` since a factory is bound to
+            // whichever thread created it.
+            unsafe {
+                winapi::um::combaseapi::CoInitializeEx(
+                    std::ptr::null_mut(),
+                    winapi::um::objbase::COINIT_APARTMENTTHREADED,
+                );
+            }
+            let params = nwg::ImageDecoder::new().ok().and_then(|decoder| compute_auto_correct_params(&decoder, &path));
+            let _ = tx.send(AutoCorrectResult { key, params });
+            notice.notice();
+            unsafe {
+                winapi::um::combaseapi::CoUninitialize();
+            }
+        });
+    }
+
+    /// The Auto Correct checkbox being unchecked: deletes the stored correction for `key` — both
+    /// in the database (`clear_image_color_correction`) and the matching in-memory record(s), the
+    /// same two `find`/mutate blocks `rotate_current_image` uses — then redraws so the photo
+    /// reverts to its uncorrected pixels immediately. Synchronous, unlike the checked path: no
+    /// decode is needed to remove six numbers.
+    fn clear_auto_correct(&self, key: &str) {
+        let db_path = self.db_path.borrow().clone();
+        let db = match db::ProjectDb::open(&db_path) {
+            Ok(db) => db,
+            Err(err) => {
+                nwg::simple_message("PhotoMatic", &format!("Failed to open the database: {err}"));
+                return;
+            }
+        };
+        if let Err(err) = db.clear_image_color_correction(key) {
+            nwg::simple_message("PhotoMatic", &format!("Failed to clear color correction: {err}"));
+            return;
+        }
+
+        let clear_fields = |record: &mut ImageRecord| {
+            record.color_black_r = None;
+            record.color_black_g = None;
+            record.color_black_b = None;
+            record.color_white_r = None;
+            record.color_white_g = None;
+            record.color_white_b = None;
+        };
+        if let Some(record) = self.images.borrow_mut().iter_mut().find(|r| r.key == key) {
+            clear_fields(record);
+        }
+        if let Some(record) = self.linked_images.borrow_mut().values_mut().find(|r| r.key == key) {
+            clear_fields(record);
+        }
+
+        self.image_cache.borrow_mut().clear();
+        self.prefetch_in_flight.borrow_mut().clear();
+        self.show_current_image();
+    }
+
+    /// Fired via `OnNotice` whenever `toggle_auto_correct`'s background thread lands a result.
+    /// Drains every result currently waiting, same as `apply_prefetch_results`. A `None` `params`
+    /// (decode/compute failure — e.g. a RAW file WIC can't decode) shows an error, same as a
+    /// failed database write; otherwise persists to the database and to whichever in-memory
+    /// record holds that key (mirrors `rotate_current_image`'s two `find`/mutate blocks). Every
+    /// branch falls through to the same resync at the end — regardless of success or failure —
+    /// rather than an early `continue`: Win32 already flips the checkbox to Checked the moment the
+    /// user clicks it, before this result lands, so a *failed* computation needs that same resync
+    /// to flip it back to Unchecked via `refresh_auto_correct_button` (reached through
+    /// `show_current_image`), not just a successful one confirming it. Only redraws if the
+    /// corrected photo is still the one on screen — regardless, the database write and in-memory
+    /// record update above already happened, so the correction isn't lost just because Prev/Next
+    /// was clicked while it was computing.
+    fn apply_auto_correct_results(&self) {
+        let rx = self.auto_correct_rx.borrow();
+        let Some(rx) = rx.as_ref() else { return };
+        while let Ok(result) = rx.try_recv() {
+            if self.auto_correct_in_flight.borrow().as_deref() == Some(result.key.as_str()) {
+                *self.auto_correct_in_flight.borrow_mut() = None;
+            }
+
+            match result.params {
+                None => {
+                    nwg::simple_message("PhotoMatic", "Failed to compute a color correction for this photo.");
+                }
+                Some(params) => {
+                    let db_path = self.db_path.borrow().clone();
+                    match db::ProjectDb::open(&db_path) {
+                        Ok(db) => match db.set_image_color_correction(&result.key, &params) {
+                            Ok(()) => {
+                                let apply_params = |record: &mut ImageRecord| {
+                                    record.color_black_r = Some(params.black[0]);
+                                    record.color_black_g = Some(params.black[1]);
+                                    record.color_black_b = Some(params.black[2]);
+                                    record.color_white_r = Some(params.white[0]);
+                                    record.color_white_g = Some(params.white[1]);
+                                    record.color_white_b = Some(params.white[2]);
+                                };
+                                if let Some(record) = self.images.borrow_mut().iter_mut().find(|r| r.key == result.key) {
+                                    apply_params(record);
+                                }
+                                if let Some(record) = self.linked_images.borrow_mut().values_mut().find(|r| r.key == result.key) {
+                                    apply_params(record);
+                                }
+                            }
+                            Err(err) => {
+                                nwg::simple_message("PhotoMatic", &format!("Failed to save color correction: {err}"));
+                            }
+                        },
+                        Err(err) => {
+                            nwg::simple_message("PhotoMatic", &format!("Failed to open the database: {err}"));
+                        }
+                    }
+                }
+            }
+
+            let index = *self.current_index.borrow();
+            let showing_counterpart = *self.showing_counterpart.borrow();
+            let still_displayed = {
+                let images = self.images.borrow();
+                let linked_images = self.linked_images.borrow();
+                record_to_display(&images, &linked_images, index, showing_counterpart).map(|r| r.key == result.key).unwrap_or(false)
+            };
+
+            if still_displayed {
+                self.image_cache.borrow_mut().clear();
+                self.prefetch_in_flight.borrow_mut().clear();
+                self.show_current_image();
+            }
+        }
+    }
+
     /// The Delete button / Delete key: removes the current photo — and, if it has a linked
     /// RAW/compressed counterpart (`linked_images`), that counterpart too — from every
     /// collection (including the default one) and every event. The `images` row and the file
@@ -836,6 +1061,17 @@ struct PrefetchResult {
 struct SendBitmap(nwg::Bitmap);
 unsafe impl Send for SendBitmap {}
 
+/// A `toggle_auto_correct` background thread's result, sent back over
+/// `auto_correct_tx`/`auto_correct_notice`. `params` is `None` when the full-resolution decode
+/// or pixel read failed (e.g. a RAW file WIC can't decode) — `apply_auto_correct_results` shows
+/// an error for that case rather than silently doing nothing, since this is a deliberate click.
+/// Naturally `Send` (a `String` and a plain `Copy` struct of `u8`s), unlike `PrefetchResult`,
+/// which needs `SendBitmap`'s `unsafe impl` to cross the same kind of channel.
+struct AutoCorrectResult {
+    key: String,
+    params: Option<color_correction::ColorCorrectionParams>,
+}
+
 /// Decodes `path`, scales it to fit inside `frame_size` preserving aspect ratio, then rotates
 /// the *already-scaled* result `rotation_degrees` clockwise (0/90/180/270 — the current photo's
 /// `ImageRecord::rotation`) — the synchronous path in `show_current_image` and every
@@ -863,7 +1099,13 @@ unsafe impl Send for SendBitmap {}
 /// - Materializing the scaled result into a real, randomly-accessible `IWICBitmap` first (rather
 ///   than leaving it as a lazy scaler chain) fixes this at the source: the rotator then reads
 ///   from an actual pixel buffer, not a decoder, regardless of access pattern.
-fn decode_and_fit(decoder: &nwg::ImageDecoder, path: &Path, frame_size: (u32, u32), rotation_degrees: i32) -> Option<nwg::Bitmap> {
+fn decode_and_fit(
+    decoder: &nwg::ImageDecoder,
+    path: &Path,
+    frame_size: (u32, u32),
+    rotation_degrees: i32,
+    color_params: Option<&color_correction::ColorCorrectionParams>,
+) -> Option<nwg::Bitmap> {
     let source = decoder.from_filename(&path.to_string_lossy()).ok()?;
     let frame = source.frame(0).ok()?;
     let fit_target_size = swapped_for_rotation(frame_size, rotation_degrees);
@@ -872,6 +1114,10 @@ fn decode_and_fit(decoder: &nwg::ImageDecoder, path: &Path, frame_size: (u32, u3
         None => frame,
     };
     let scaled = materialize_bitmap(decoder, &scaled)?;
+    let scaled = match color_params {
+        Some(params) => apply_color_correction(decoder, &scaled, params)?,
+        None => scaled,
+    };
     let rotated = rotate_frame(decoder, &scaled, rotation_degrees)?;
     rotated.as_bitmap().ok()
 }
@@ -938,6 +1184,93 @@ pub(crate) fn rotate_frame(decoder: &nwg::ImageDecoder, frame: &nwg::ImageData, 
         }
         Some(nwg::ImageData { frame: rotator as *mut IWICBitmapSource })
     }
+}
+
+/// Reads `image` as a flat, top-to-bottom, left-to-right buffer of 24bpp RGB triples, converting
+/// from whatever pixel format the source actually has (via `WICConvertBitmapSource`, a one-call
+/// convert-and-copy that needs no `IWICImagingFactory` — unlike `materialize_bitmap`/
+/// `rotate_frame`, which build filters off `decoder.factory`). `None` on any WIC failure. Used
+/// both to read pixel statistics (`compute_auto_correct_params`) and, by `apply_color_correction`
+/// below, as the format every correction is computed and written back against.
+fn read_rgb24_pixels(image: &nwg::ImageData) -> Option<(u32, u32, Vec<u8>)> {
+    use winapi::shared::winerror::S_OK;
+    use winapi::um::wincodec::{GUID_WICPixelFormat24bppRGB, IWICBitmapSource, WICConvertBitmapSource};
+
+    let (width, height) = image.size();
+    unsafe {
+        let mut converted: *mut IWICBitmapSource = std::ptr::null_mut();
+        let source = image.frame as *const IWICBitmapSource;
+        if WICConvertBitmapSource(&GUID_WICPixelFormat24bppRGB, source, &mut converted) != S_OK {
+            return None;
+        }
+        let stride = width * 3;
+        let mut buffer = vec![0u8; (stride * height) as usize];
+        let copied = (&*converted).CopyPixels(std::ptr::null(), stride, buffer.len() as u32, buffer.as_mut_ptr()) == S_OK;
+        (&*converted).Release();
+        if !copied {
+            return None;
+        }
+        Some((width, height, buffer))
+    }
+}
+
+/// Applies `params`'s per-channel Simplest Color Balance stretch to every pixel of `image`,
+/// returning a new, real (`CreateBitmapFromMemory`-backed) `ImageData` in canonical 24bpp RGB —
+/// regardless of `image`'s own native pixel format, via `read_rgb24_pixels`. Shared by
+/// `decode_and_fit` (on-screen display) and `export::export_one` (recompressed export), so this
+/// pixel-walk/WIC-interop logic lives in exactly one place. `None` on any WIC failure, handled
+/// the same as every other stage in this pipeline (falls back to "preview unavailable" on
+/// display, an export error during export).
+pub(crate) fn apply_color_correction(
+    decoder: &nwg::ImageDecoder,
+    image: &nwg::ImageData,
+    params: &color_correction::ColorCorrectionParams,
+) -> Option<nwg::ImageData> {
+    use winapi::shared::winerror::S_OK;
+    use winapi::um::wincodec::{GUID_WICPixelFormat24bppRGB, IWICBitmap, IWICImagingFactory};
+
+    let (width, height, mut buffer) = read_rgb24_pixels(image)?;
+
+    let luts = [
+        color_correction::build_lut(params.black[0], params.white[0]),
+        color_correction::build_lut(params.black[1], params.white[1]),
+        color_correction::build_lut(params.black[2], params.white[2]),
+    ];
+    for pixel in buffer.chunks_exact_mut(3) {
+        pixel[0] = luts[0][pixel[0] as usize];
+        pixel[1] = luts[1][pixel[1] as usize];
+        pixel[2] = luts[2][pixel[2] as usize];
+    }
+
+    let stride = width * 3;
+    unsafe {
+        let factory = &*(decoder.factory as *const IWICImagingFactory);
+        let mut bitmap: *mut IWICBitmap = std::ptr::null_mut();
+        let created = factory.CreateBitmapFromMemory(
+            width,
+            height,
+            &GUID_WICPixelFormat24bppRGB,
+            stride,
+            buffer.len() as u32,
+            buffer.as_ptr(),
+            &mut bitmap,
+        );
+        if created != S_OK {
+            return None;
+        }
+        Some(nwg::ImageData { frame: bitmap as *mut winapi::um::wincodec::IWICBitmapSource })
+    }
+}
+
+/// Decodes the *full-resolution* source at `path` (no scaling — statistically meaningful clip
+/// points need the real pixel distribution, not a viewport-sized preview) and computes its
+/// Simplest Color Balance correction. The one part of `toggle_auto_correct`'s background
+/// thread that touches WIC; kept separate so the thread closure itself stays plain glue.
+fn compute_auto_correct_params(decoder: &nwg::ImageDecoder, path: &Path) -> Option<color_correction::ColorCorrectionParams> {
+    let source = decoder.from_filename(&path.to_string_lossy()).ok()?;
+    let frame = source.frame(0).ok()?;
+    let (_, _, buffer) = read_rgb24_pixels(&frame)?;
+    Some(color_correction::compute_scb_params(&buffer, 3, color_correction::DEFAULT_CLIP_FRACTION))
 }
 
 /// The pixel size an `img`-sized frame should be resized to so it fits inside `frame_size`

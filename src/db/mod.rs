@@ -325,6 +325,22 @@ impl ProjectDb {
         images::set_rotation(&self.conn, key, rotation)
     }
 
+    /// Writes one image's Simplest Color Balance correction — the Image Viewer's Auto Correct
+    /// checkbox being checked.
+    pub fn set_image_color_correction(
+        &self,
+        key: &str,
+        params: &crate::color_correction::ColorCorrectionParams,
+    ) -> Result<(), DbError> {
+        images::set_color_correction(&self.conn, key, params)
+    }
+
+    /// Deletes one image's Simplest Color Balance correction — the Image Viewer's Auto Correct
+    /// checkbox being unchecked.
+    pub fn clear_image_color_correction(&self, key: &str) -> Result<(), DbError> {
+        images::clear_color_correction(&self.conn, key)
+    }
+
     /// Removes one image from every collection it belongs to, default collection included —
     /// backs the Image Viewer's Delete button.
     pub fn remove_image_from_all_collections(&self, image_key: &str) -> Result<(), DbError> {
@@ -405,7 +421,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 12);
+        assert_eq!(db.schema_version().unwrap(), 13);
 
         std::fs::remove_file(&path).ok();
     }

@@ -41,6 +41,15 @@ pub struct ImageRecord {
     /// Degrees clockwise (0/90/180/270) the Image Viewer's Rotate button has rotated this
     /// photo, wrapping back to 0 past 270. `None` means no rotation has ever been applied.
     pub rotation: Option<i32>,
+    /// Simplest Color Balance low/high clip points (0-255) the Image Viewer's Auto Correct
+    /// button computed for this photo, one pair per RGB channel. `None` (on any of the six)
+    /// means Auto Correct has never been run — see `color_correction::from_record`.
+    pub color_black_r: Option<u8>,
+    pub color_black_g: Option<u8>,
+    pub color_black_b: Option<u8>,
+    pub color_white_r: Option<u8>,
+    pub color_white_g: Option<u8>,
+    pub color_white_b: Option<u8>,
 }
 
 /// A row in the `directories` table.

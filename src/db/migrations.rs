@@ -18,7 +18,8 @@ fn migrations() -> &'static Migrations<'static> {
             M::up(include_str!("migrations/0010_add_collection_shortcut.sql")),
             M::up(include_str!("migrations/0011_add_image_rotation.sql")),
             M::up(include_str!("migrations/0012_add_collection_current_image.sql")),
-            // M::up(include_str!("migrations/0013_....sql")),  <- next migration goes here
+            M::up(include_str!("migrations/0013_add_image_color_correction.sql")),
+            // M::up(include_str!("migrations/0014_....sql")),  <- next migration goes here
         ])
     })
 }

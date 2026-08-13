@@ -4,6 +4,7 @@ mod about_modal;
 mod app;
 mod collection_modal;
 mod collection_tree;
+mod color_correction;
 mod context_tabs;
 mod db;
 mod event_tree;

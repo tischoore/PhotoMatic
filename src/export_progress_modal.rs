@@ -8,6 +8,7 @@ use native_windows_derive::NwgUi;
 use native_windows_gui as nwg;
 use nwg::NativeUi;
 
+use crate::color_correction;
 use crate::db::models::ImageRecord;
 use crate::explorer;
 use crate::export::{self, ExportOptions, ExportOutcome};
@@ -74,7 +75,8 @@ fn run_export(
         let file_name = Path::new(&record.path).file_name().and_then(|n| n.to_str()).unwrap_or(&record.path);
         let dest = options.output_dir.join(export::indexed_file_name(index + 1, digit_count, file_name, options.recompression));
 
-        match export::export_one(&src, &dest, record.rotation.unwrap_or(0), options.recompression, options.rescale) {
+        let color_params = color_correction::from_record(record);
+        match export::export_one(&src, &dest, record.rotation.unwrap_or(0), color_params, options.recompression, options.rescale) {
             Ok(()) => copied += 1,
             Err(err) => errors.push(format!("{}: {err}", record.path)),
         }

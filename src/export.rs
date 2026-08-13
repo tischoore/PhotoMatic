@@ -4,6 +4,7 @@ use std::ptr;
 
 use native_windows_gui as nwg;
 
+use crate::color_correction::ColorCorrectionParams;
 use crate::image_viewer;
 
 /// The options collected by the Export dialog (`export_modal.rs`) and handed to the Exporting
@@ -156,21 +157,24 @@ pub fn directory_is_non_empty(path: &Path) -> bool {
 /// Exports a single picture from `src` to `dest`.
 ///
 /// `Recompression::None` is a plain, byte-identical `std::fs::copy` — no WIC/COM involved, no
-/// rotation applied. `Large`/`Small` decode the full-resolution source, optionally resize it to
-/// `rescale` (aspect-ratio-preserving — see `scaled_output_size` — computed against the image's
-/// *final*, post-rotation orientation, then converted back to a pre-rotation resize target via a
-/// width/height swap when `rotation_degrees` is 90/270, exactly as `image_viewer::decode_and_fit`
-/// already does for on-screen display, since resizing happens before rotating), bake in
-/// `rotation_degrees` via the same WIC rotator `image_viewer` uses for display, and re-encode as
-/// JPEG at the chosen quality. This is the one part of the export feature with no prior
-/// WIC-encoder precedent in this codebase (decode/scale/rotate all reuse `image_viewer`'s
-/// helpers; encoding is new) — it has no unit tests, matching this codebase's existing practice
-/// of leaving WIC COM calls (`image_viewer::rotate_frame`/`materialize_bitmap`) untested and
-/// verified manually instead.
+/// rotation or color correction applied. `Large`/`Small` decode the full-resolution source,
+/// optionally resize it to `rescale` (aspect-ratio-preserving — see `scaled_output_size` —
+/// computed against the image's *final*, post-rotation orientation, then converted back to a
+/// pre-rotation resize target via a width/height swap when `rotation_degrees` is 90/270, exactly
+/// as `image_viewer::decode_and_fit` already does for on-screen display, since resizing happens
+/// before rotating), bake in `color_params` (if the photo has ever had Auto Correct run on it)
+/// and `rotation_degrees` via the same WIC helpers `image_viewer` uses for display — in that
+/// order, mirroring `decode_and_fit`'s own "materialize -> correct -> rotate" sequence — and
+/// re-encode as JPEG at the chosen quality. This is the one part of the export feature with no
+/// prior WIC-encoder precedent in this codebase (decode/scale/correct/rotate all reuse
+/// `image_viewer`'s helpers; encoding is new) — it has no unit tests, matching this codebase's
+/// existing practice of leaving WIC COM calls (`image_viewer::rotate_frame`/`materialize_bitmap`/
+/// `apply_color_correction`) untested and verified manually instead.
 pub fn export_one(
     src: &Path,
     dest: &Path,
     rotation_degrees: i32,
+    color_params: Option<ColorCorrectionParams>,
     recompression: Recompression,
     rescale: Option<RescaleTarget>,
 ) -> Result<(), String> {
@@ -200,7 +204,12 @@ pub fn export_one(
 
     let materialized = image_viewer::materialize_bitmap(&decoder, &scaled)
         .ok_or_else(|| "Failed to prepare the image for rotation".to_string())?;
-    let rotated = image_viewer::rotate_frame(&decoder, &materialized, rotation_degrees)
+    let corrected = match color_params {
+        Some(params) => image_viewer::apply_color_correction(&decoder, &materialized, &params)
+            .ok_or_else(|| "Failed to apply color correction".to_string())?,
+        None => materialized,
+    };
+    let rotated = image_viewer::rotate_frame(&decoder, &corrected, rotation_degrees)
         .ok_or_else(|| "Failed to apply rotation".to_string())?;
 
     write_jpeg(&decoder, &rotated, dest, quality)

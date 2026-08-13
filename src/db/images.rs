@@ -37,7 +37,7 @@ pub fn upsert_images(conn: &mut Connection, images: &[ImageRecord]) -> Result<()
 /// `ImageRecord` query, without duplicating it.
 pub(super) const IMAGE_COLUMNS: &str = "key, path, image_type, toplevel_dir, date_taken, width, height, \
      exposure_time, iso, focal_length, gps_latitude, gps_longitude, gps_altitude, metadata_read_at, linked_key, \
-     rotation";
+     rotation, color_black_r, color_black_g, color_black_b, color_white_r, color_white_g, color_white_b";
 
 pub(super) fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord> {
     Ok(ImageRecord {
@@ -57,6 +57,12 @@ pub(super) fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord
         metadata_read_at: row.get(13)?,
         linked_key: row.get(14)?,
         rotation: row.get(15)?,
+        color_black_r: row.get(16)?,
+        color_black_g: row.get(17)?,
+        color_black_b: row.get(18)?,
+        color_white_r: row.get(19)?,
+        color_white_g: row.get(20)?,
+        color_white_b: row.get(21)?,
     })
 }
 
@@ -179,6 +185,42 @@ pub fn clear_raw_links(conn: &Connection) -> Result<(), DbError> {
 pub fn set_rotation(conn: &Connection, key: &str, rotation: i32) -> Result<(), DbError> {
     conn.execute("UPDATE images SET rotation = ?2 WHERE key = ?1", rusqlite::params![key, rotation])
         .map_err(DbError::Sqlite)?;
+    Ok(())
+}
+
+/// Writes the current photo's Simplest Color Balance correction (a low/high clip point per RGB
+/// channel) — backs the Image Viewer's Auto Correct button.
+pub fn set_color_correction(
+    conn: &Connection,
+    key: &str,
+    params: &crate::color_correction::ColorCorrectionParams,
+) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE images SET color_black_r = ?2, color_black_g = ?3, color_black_b = ?4, \
+         color_white_r = ?5, color_white_g = ?6, color_white_b = ?7 WHERE key = ?1",
+        rusqlite::params![
+            key,
+            params.black[0],
+            params.black[1],
+            params.black[2],
+            params.white[0],
+            params.white[1],
+            params.white[2],
+        ],
+    )
+    .map_err(DbError::Sqlite)?;
+    Ok(())
+}
+
+/// Nulls out the current photo's Simplest Color Balance correction — backs the Image Viewer's
+/// Auto Correct checkbox being unchecked.
+pub fn clear_color_correction(conn: &Connection, key: &str) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE images SET color_black_r = NULL, color_black_g = NULL, color_black_b = NULL, \
+         color_white_r = NULL, color_white_g = NULL, color_white_b = NULL WHERE key = ?1",
+        rusqlite::params![key],
+    )
+    .map_err(DbError::Sqlite)?;
     Ok(())
 }
 
@@ -346,5 +388,34 @@ mod tests {
         set_rotation(&conn, "a", 90).unwrap();
 
         assert_eq!(list_images(&conn).unwrap()[0].rotation, Some(90));
+    }
+
+    #[test]
+    fn set_color_correction_round_trips_through_list_images() {
+        use crate::color_correction::ColorCorrectionParams;
+
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("a", "a.jpg", "jpg")]).unwrap();
+        assert_eq!(crate::color_correction::from_record(&list_images(&conn).unwrap()[0]), None);
+
+        let params = ColorCorrectionParams { black: [1, 2, 3], white: [250, 251, 252] };
+        set_color_correction(&conn, "a", &params).unwrap();
+
+        assert_eq!(crate::color_correction::from_record(&list_images(&conn).unwrap()[0]), Some(params));
+    }
+
+    #[test]
+    fn clear_color_correction_nulls_previously_set_columns() {
+        use crate::color_correction::ColorCorrectionParams;
+
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("a", "a.jpg", "jpg")]).unwrap();
+        let params = ColorCorrectionParams { black: [1, 2, 3], white: [250, 251, 252] };
+        set_color_correction(&conn, "a", &params).unwrap();
+        assert_eq!(crate::color_correction::from_record(&list_images(&conn).unwrap()[0]), Some(params));
+
+        clear_color_correction(&conn, "a").unwrap();
+
+        assert_eq!(crate::color_correction::from_record(&list_images(&conn).unwrap()[0]), None);
     }
 }

@@ -111,6 +111,12 @@ mod tests {
             metadata_read_at: None,
             linked_key: None,
             rotation: None,
+            color_black_r: None,
+            color_black_g: None,
+            color_black_b: None,
+            color_white_r: None,
+            color_white_g: None,
+            color_white_b: None,
         };
         assert_eq!(
             image_row(&record),
@@ -147,6 +153,12 @@ mod tests {
             metadata_read_at: None,
             linked_key: None,
             rotation: None,
+            color_black_r: None,
+            color_black_g: None,
+            color_black_b: None,
+            color_white_r: None,
+            color_white_g: None,
+            color_white_b: None,
         };
         assert_eq!(
             image_row(&record),
