@@ -1,6 +1,6 @@
 # PhotoMatic
 
-A native Windows desktop application written in Rust, using [native-windows-gui](https://github.com/gabdube/native-windows-gui) for a classic Win32 look: a real menu bar, native dialogs, and no browser/canvas rendering underneath.
+A native Windows desktop application written in Rust, using [native-windows-gui](https://github.com/gabdube/native-windows-gui) for a classic Win32 look: a real menu bar, native dialogs, and no browser/canvas rendering underneath and has no dependancies on online resources while running. It is also using multiple worker threads to do the actual work concurrently.
 
 ## Features
 
