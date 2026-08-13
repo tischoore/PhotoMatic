@@ -50,6 +50,10 @@ cargo build --release # optimized build, output in target\release\photomatic.exe
 
 Open this folder in VS Code and press **F5** to build and launch under the debugger. This requires the [CodeLLDB](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb) extension (VS Code will prompt to install it if missing). Use `Ctrl+Shift+B` to just build without debugging.
 
+### Continuous integration and releases
+
+`.github/workflows/ci.yml` builds and runs `cargo test` on `windows-latest` for every push and pull request. `.github/workflows/release.yml` triggers on pushing a tag matching `v*` (e.g. `v1.0.0`): it builds `cargo build --release`, zips `photomatic.exe`, and publishes it to the repo's GitHub Releases page automatically — no separate portal setup is needed, since both workflows are defined entirely by these committed YAML files.
+
 ## Testing
 
 ```powershell
