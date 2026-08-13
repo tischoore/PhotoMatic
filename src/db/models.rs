@@ -122,6 +122,11 @@ pub struct CollectionRecord {
     /// The single-character key assigned to this collection (e.g. `"d"` for the
     /// default collection), shown as an Image Viewer button's label.
     pub shortcut: String,
+    /// The `key` of the photo the Image Viewer should resume on when this collection is
+    /// next opened. `None` means either nothing has been viewed yet, or the last-viewed
+    /// photo was the first one in the (date-sorted) list — both cases start at index 0, so
+    /// there's no need to distinguish them. See `image_viewer::start_index_for_current_img`.
+    pub current_img: Option<String>,
 }
 
 #[cfg(test)]

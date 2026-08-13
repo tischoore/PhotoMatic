@@ -278,6 +278,13 @@ impl ProjectDb {
         collections::get_collection(&self.conn, id)
     }
 
+    /// Records which photo the Image Viewer should resume on for this collection —
+    /// `None` when it's the collection's first photo. Called on every navigation while a
+    /// collection-scoped Image Viewer session is open.
+    pub fn set_collection_current_image(&self, collection_id: i64, image_key: Option<&str>) -> Result<(), DbError> {
+        collections::set_current_image(&self.conn, collection_id, image_key)
+    }
+
     /// The id of the default collection (structurally, the lowest-id `collections` row) —
     /// lets the GUI grey out Delete for it.
     pub fn default_collection_id(&self) -> Result<Option<i64>, DbError> {
@@ -398,7 +405,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
 
         std::fs::remove_file(&path).ok();
     }

@@ -48,7 +48,11 @@ const COLLECTION_BUTTON_WIDTH: f32 = 40.0;
 /// the collection ids it currently belongs to — both preloaded once, the same way
 /// `linked_images` is. `db_path` is the project database's absolute path, used only when a
 /// collection toggle button is actually clicked (see `toggle_collection`) — the viewer
-/// otherwise never touches the database itself.
+/// otherwise never touches the database itself. `viewing_collection` is `Some(collection_id)`
+/// when this session was opened on one particular collection (`App::open_collection_viewer`),
+/// `None` for an event-scoped session (`App::open_image_viewer`) — it gates
+/// `persist_current_image`, since `collections.current_img` only makes sense for a
+/// collection-scoped session.
 ///
 /// Runs on its own thread rather than a separate process (see `CLAUDE.md`/the design plan):
 /// NWG requires one message loop per thread, so a second *window* already can't share the main
@@ -67,6 +71,7 @@ pub fn open(
     collections: Vec<CollectionRecord>,
     membership: HashMap<String, HashSet<i64>>,
     db_path: PathBuf,
+    viewing_collection: Option<i64>,
 ) {
     thread::spawn(move || {
         // `nwg::ImageDecoder` creates its WIC factory via `CoCreateInstance`, which requires COM
@@ -90,6 +95,7 @@ pub fn open(
         *viewer.collections.borrow_mut() = collections;
         *viewer.membership.borrow_mut() = membership;
         *viewer.db_path.borrow_mut() = db_path;
+        *viewer.viewing_collection.borrow_mut() = viewing_collection;
         *viewer.image_cache.borrow_mut() = ImageCache::new(IMAGE_CACHE_CAPACITY);
 
         // Not a plain `nwg::dispatch_thread_events()`: that call routes every message through
@@ -163,6 +169,11 @@ pub struct ImageViewer {
     /// `toggle_collection` each time a collection button is actually clicked; nothing else in
     /// this viewer touches the database.
     db_path: RefCell<PathBuf>,
+    /// `Some(collection_id)` when this session was opened on one particular collection
+    /// (`App::open_collection_viewer`), `None` for an event-scoped session. Gates
+    /// `persist_current_image`, since `collections.current_img` only applies to a
+    /// collection-scoped session.
+    viewing_collection: RefCell<Option<i64>>,
     /// One `(checkbox, collection_id)` pair per collection, built once by
     /// `build_collection_buttons` — `setup`'s click dispatch matches a clicked handle against
     /// this to know which collection to toggle, and `refresh_collection_buttons` iterates it
@@ -508,6 +519,25 @@ impl ImageViewer {
         drop(linked_images);
         drop(images);
         self.schedule_prefetch();
+        self.persist_current_image();
+    }
+
+    /// Persists which photo to resume on next time this collection is viewed
+    /// (`collections.current_img`) — a no-op for an event-scoped session (`viewing_collection`
+    /// is `None`). Called every time `show_current_image` successfully displays a photo, so
+    /// this covers initial open, Prev/Next, and the redisplay after a delete alike. Errors are
+    /// swallowed rather than shown via `nwg::simple_message`: this is background bookkeeping on
+    /// every navigation, not a user-initiated action like Rotate/collection-toggle, so a dialog
+    /// on every failed write would be disruptive.
+    fn persist_current_image(&self) {
+        let Some(collection_id) = *self.viewing_collection.borrow() else { return };
+        let index = *self.current_index.borrow();
+        let key = current_img_for_index(&self.images.borrow(), index);
+
+        let db_path = self.db_path.borrow().clone();
+        if let Ok(db) = db::ProjectDb::open(&db_path) {
+            let _ = db.set_collection_current_image(collection_id, key.as_deref());
+        }
     }
 
     /// Kicks off a background decode for every photo `prefetch_targets` says should be ready
@@ -752,7 +782,17 @@ impl ImageViewer {
             old_len
         };
 
-        let Some(new_index) = index_after_removal(index, old_len) else { return self.close() };
+        let Some(new_index) = index_after_removal(index, old_len) else {
+            // The collection is now empty, so `show_current_image` (which would otherwise
+            // persist this) never runs again — clear `current_img` directly instead.
+            if let Some(collection_id) = *self.viewing_collection.borrow() {
+                let db_path = self.db_path.borrow().clone();
+                if let Ok(db) = db::ProjectDb::open(&db_path) {
+                    let _ = db.set_collection_current_image(collection_id, None);
+                }
+            }
+            return self.close();
+        };
         *self.current_index.borrow_mut() = new_index;
         *self.showing_counterpart.borrow_mut() = false;
         self.image_cache.borrow_mut().clear();
@@ -1004,6 +1044,27 @@ fn next_rotation(current: Option<i32>) -> i32 {
     (current.unwrap_or(0) + 90) % 360
 }
 
+/// What `persist_current_image` should write as `collections.current_img` for the photo at
+/// `index` in `images` — `None` when it's the first photo, so the DB column stays `NULL` for
+/// the common "start of the collection" case instead of redundantly storing its key. Kept as a
+/// free function so this is unit-testable without a window or database.
+fn current_img_for_index(images: &[ImageRecord], index: usize) -> Option<String> {
+    if index == 0 {
+        None
+    } else {
+        images.get(index).map(|r| r.key.clone())
+    }
+}
+
+/// The index `App::open_collection_viewer` should start the viewer on, given the collection's
+/// stored `current_img` and a freshly-queried image list: the position of that key if it's
+/// still present, otherwise 0 — covering both `current_img` being `None` (never viewed, or was
+/// viewing the first photo) and it naming a photo since removed from the collection. Kept as a
+/// free function so this is unit-testable without a window or database.
+pub fn start_index_for_current_img(images: &[ImageRecord], current_img: Option<&str>) -> usize {
+    current_img.and_then(|key| images.iter().position(|r| r.key == key)).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,6 +1140,42 @@ mod tests {
     #[test]
     fn next_rotation_wraps_from_270_to_0() {
         assert_eq!(next_rotation(Some(270)), 0);
+    }
+
+    #[test]
+    fn current_img_for_index_is_none_for_the_first_photo() {
+        let images = vec![image("a", "a.jpg"), image("b", "b.jpg")];
+        assert_eq!(current_img_for_index(&images, 0), None);
+    }
+
+    #[test]
+    fn current_img_for_index_is_the_key_for_a_later_photo() {
+        let images = vec![image("a", "a.jpg"), image("b", "b.jpg")];
+        assert_eq!(current_img_for_index(&images, 1), Some("b".to_string()));
+    }
+
+    #[test]
+    fn start_index_for_current_img_is_zero_when_none() {
+        let images = vec![image("a", "a.jpg"), image("b", "b.jpg")];
+        assert_eq!(start_index_for_current_img(&images, None), 0);
+    }
+
+    #[test]
+    fn start_index_for_current_img_finds_a_present_key() {
+        let images = vec![image("a", "a.jpg"), image("b", "b.jpg")];
+        assert_eq!(start_index_for_current_img(&images, Some("b")), 1);
+    }
+
+    #[test]
+    fn start_index_for_current_img_falls_back_to_zero_when_key_is_gone() {
+        let images = vec![image("a", "a.jpg"), image("b", "b.jpg")];
+        assert_eq!(start_index_for_current_img(&images, Some("deleted")), 0);
+    }
+
+    #[test]
+    fn start_index_for_current_img_falls_back_to_zero_for_an_empty_list() {
+        let images: Vec<ImageRecord> = vec![];
+        assert_eq!(start_index_for_current_img(&images, Some("a")), 0);
     }
 
     #[test]

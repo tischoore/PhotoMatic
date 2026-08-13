@@ -1263,7 +1263,7 @@ impl App {
             let Some(db) = db.as_ref() else { return };
             db.list_images_by_directory(&dir_name, image_type.as_deref()).unwrap_or_default()
         };
-        self.open_viewer_with_images(title, images, 0);
+        self.open_viewer_with_images(title, images, 0, None);
     }
 
     /// Builds one Context Window tab: a `Tab` in `context_tabs_container` holding a
@@ -1583,30 +1583,41 @@ impl App {
             let Some(event) = db.get_event(event_id).ok().flatten() else { return };
             (event.title, db.event_images(event_id).unwrap_or_default())
         };
-        self.open_viewer_with_images(title, images, start_index);
+        self.open_viewer_with_images(title, images, start_index, None);
     }
 
     /// The `collection_context_menu`'s View item's opener: the Image Viewer for
-    /// `collection_id`'s photos, ordered by `date_taken`, starting at the first one.
+    /// `collection_id`'s photos, ordered by `date_taken`, starting on whichever photo
+    /// `collections.current_img` names (`image_viewer::start_index_for_current_img`), or the
+    /// first one if that's `None` or no longer in the collection.
     /// `show_collection_context_menu` already disables View while a collection has no photos,
     /// but `open_viewer_with_images`'s own empty check guards this too, in case membership
     /// changed between the right-click and the click.
     fn open_collection_viewer(&self, collection_id: i64) {
-        let (title, images) = {
+        let (title, images, start_index) = {
             let db = self.db.borrow();
             let Some(db) = db.as_ref() else { return };
             let Some(collection) = db.get_collection(collection_id).ok().flatten() else { return };
-            (collection.name, db.collection_images(collection_id).unwrap_or_default())
+            let images = db.collection_images(collection_id).unwrap_or_default();
+            let start_index = image_viewer::start_index_for_current_img(&images, collection.current_img.as_deref());
+            (collection.name, images, start_index)
         };
-        self.open_viewer_with_images(title, images, 0);
+        self.open_viewer_with_images(title, images, start_index, Some(collection_id));
     }
 
     /// Shared by `open_image_viewer` and `open_collection_viewer`: batch-fetches every
     /// displayed photo's linked RAW/compressed counterpart (`list_images_by_keys`) and every
     /// collection each currently belongs to (`collections_for_images`), loads the full list of
     /// collections (for the viewer's per-collection toggle buttons), and opens the viewer
-    /// window/thread with all of it preloaded.
-    fn open_viewer_with_images(&self, title: String, images: Vec<db::models::ImageRecord>, start_index: usize) {
+    /// window/thread with all of it preloaded. `viewing_collection` is `Some(collection_id)` for
+    /// `open_collection_viewer`, `None` for `open_image_viewer` — see `image_viewer::open`.
+    fn open_viewer_with_images(
+        &self,
+        title: String,
+        images: Vec<db::models::ImageRecord>,
+        start_index: usize,
+        viewing_collection: Option<i64>,
+    ) {
         if images.is_empty() {
             return;
         }
@@ -1635,7 +1646,17 @@ impl App {
         };
         let (Some(source_dir), Some(db_path)) = (source_dir, db_path) else { return };
         let start_index = start_index.min(images.len() - 1);
-        image_viewer::open(title, images, linked_images, start_index, source_dir, collections, membership, db_path);
+        image_viewer::open(
+            title,
+            images,
+            linked_images,
+            start_index,
+            source_dir,
+            collections,
+            membership,
+            db_path,
+            viewing_collection,
+        );
     }
 
     /// An event tab's title input or notes box firing `OnTextInput`: reads both controls'

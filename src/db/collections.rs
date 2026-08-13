@@ -103,11 +103,17 @@ pub fn delete_collection(conn: &mut Connection, id: i64) -> Result<(), DbError> 
 /// node and the Image Viewer's per-collection toggle buttons.
 pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionRecord>, DbError> {
     let mut stmt = conn
-        .prepare("SELECT id, name, description, shortcut FROM collections ORDER BY id ASC")
+        .prepare("SELECT id, name, description, shortcut, current_img FROM collections ORDER BY id ASC")
         .map_err(DbError::Sqlite)?;
     let rows = stmt
         .query_map([], |row| {
-            Ok(CollectionRecord { id: row.get(0)?, name: row.get(1)?, description: row.get(2)?, shortcut: row.get(3)? })
+            Ok(CollectionRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                shortcut: row.get(3)?,
+                current_img: row.get(4)?,
+            })
         })
         .map_err(DbError::Sqlite)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Sqlite)
@@ -115,11 +121,34 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionRecord>, DbEr
 
 /// A single collection by id, for prefilling the "Edit Collection..." dialog.
 pub fn get_collection(conn: &Connection, id: i64) -> Result<Option<CollectionRecord>, DbError> {
-    conn.query_row("SELECT id, name, description, shortcut FROM collections WHERE id = ?1", rusqlite::params![id], |row| {
-        Ok(CollectionRecord { id: row.get(0)?, name: row.get(1)?, description: row.get(2)?, shortcut: row.get(3)? })
-    })
+    conn.query_row(
+        "SELECT id, name, description, shortcut, current_img FROM collections WHERE id = ?1",
+        rusqlite::params![id],
+        |row| {
+            Ok(CollectionRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                shortcut: row.get(3)?,
+                current_img: row.get(4)?,
+            })
+        },
+    )
     .optional()
     .map_err(DbError::Sqlite)
+}
+
+/// Records which photo the Image Viewer should resume on for `collection_id` — `None` when
+/// it's the collection's first photo (or nothing has been viewed yet), so the common "start
+/// at the beginning" case needs no special-casing on load. See
+/// `image_viewer::start_index_for_current_img`.
+pub fn set_current_image(conn: &Connection, collection_id: i64, image_key: Option<&str>) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE collections SET current_img = ?2 WHERE id = ?1",
+        rusqlite::params![collection_id, image_key],
+    )
+    .map_err(DbError::Sqlite)?;
+    Ok(())
 }
 
 /// The id of the default collection — structurally, whichever `collections` row currently
@@ -367,8 +396,20 @@ mod tests {
         assert_eq!(
             collections,
             vec![
-                CollectionRecord { id: first, name: "Trip A".to_string(), description: "First".to_string(), shortcut: "a".to_string() },
-                CollectionRecord { id: second, name: "Trip B".to_string(), description: "Second".to_string(), shortcut: "b".to_string() },
+                CollectionRecord {
+                    id: first,
+                    name: "Trip A".to_string(),
+                    description: "First".to_string(),
+                    shortcut: "a".to_string(),
+                    current_img: None,
+                },
+                CollectionRecord {
+                    id: second,
+                    name: "Trip B".to_string(),
+                    description: "Second".to_string(),
+                    shortcut: "b".to_string(),
+                    current_img: None,
+                },
             ]
         );
     }
@@ -384,6 +425,20 @@ mod tests {
         assert_eq!(record.name, "Renamed");
         assert_eq!(record.description, "Updated");
         assert_eq!(record.shortcut, "z");
+    }
+
+    #[test]
+    fn set_current_image_round_trips_through_get_collection() {
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("a", "a.jpg")]).unwrap();
+        let id = create_collection(&conn, "Trip A", "First", "a").unwrap();
+        assert_eq!(get_collection(&conn, id).unwrap().unwrap().current_img, None);
+
+        set_current_image(&conn, id, Some("a")).unwrap();
+        assert_eq!(get_collection(&conn, id).unwrap().unwrap().current_img, Some("a".to_string()));
+
+        set_current_image(&conn, id, None).unwrap();
+        assert_eq!(get_collection(&conn, id).unwrap().unwrap().current_img, None);
     }
 
     #[test]
