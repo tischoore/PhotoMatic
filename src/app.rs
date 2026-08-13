@@ -17,6 +17,9 @@ use crate::db;
 use crate::event_tree;
 use crate::exif;
 use crate::explorer;
+use crate::export;
+use crate::export_modal;
+use crate::export_progress_modal;
 use crate::image_viewer;
 use crate::keyboard;
 use crate::nav_tree;
@@ -300,6 +303,11 @@ pub struct App {
     /// closes — `None` means the dialog was opened via Add Collection (create a new row on
     /// Accept); `Some(id)` means it was opened via Edit (update that row instead).
     collection_modal_editing_id: RefCell<Option<i64>>,
+    export_options_thread: RefCell<Option<thread::JoinHandle<Option<export::ExportOptions>>>>,
+    /// Which collection the pending `export_options_thread` result applies to — stashed by
+    /// `export_selected_collection`, consumed by `export_options_closed`.
+    export_options_collection_id: RefCell<Option<i64>>,
+    export_progress_thread: RefCell<Option<thread::JoinHandle<export::ExportOutcome>>>,
 
     #[nwg_control(title: "PhotoMatic", flags: "MAIN_WINDOW")]
     #[nwg_events(OnWindowClose: [App::exit], OnKeyPress: [App::on_key_press(SELF, EVT_DATA)])]
@@ -312,6 +320,14 @@ pub struct App {
     #[nwg_control]
     #[nwg_events(OnNotice: [App::collection_modal_closed])]
     collection_notice: nwg::Notice,
+
+    #[nwg_control]
+    #[nwg_events(OnNotice: [App::export_options_closed])]
+    export_options_notice: nwg::Notice,
+
+    #[nwg_control]
+    #[nwg_events(OnNotice: [App::export_finished])]
+    export_progress_notice: nwg::Notice,
 
     #[nwg_control]
     #[nwg_events(OnNotice: [App::scan_finished])]
@@ -517,6 +533,13 @@ pub struct App {
     #[nwg_control(parent: collection_context_menu, text: "&Delete")]
     #[nwg_events(OnMenuItemSelected: [App::delete_selected_collection])]
     collection_context_menu_delete: nwg::MenuItem,
+
+    // "Ex&port", not "&Export": "&Edit" (above) already claims E as its mnemonic within this
+    // same menu, and CLAUDE.md requires mnemonics to be unique among siblings. No accelerator —
+    // there's no standard Windows Ctrl+ binding for "Export".
+    #[nwg_control(parent: collection_context_menu, text: "Ex&port...")]
+    #[nwg_events(OnMenuItemSelected: [App::export_selected_collection])]
+    collection_context_menu_export: nwg::MenuItem,
 
     #[nwg_control(parent: context_frame, flags: "VISIBLE")]
     #[nwg_events(
@@ -1059,6 +1082,7 @@ impl App {
         *self.collection_context_id.borrow_mut() = Some(collection_id);
         let has_images = db.collection_image_count(collection_id).unwrap_or(0) > 0;
         self.collection_context_menu_view.set_enabled(has_images);
+        self.collection_context_menu_export.set_enabled(has_images);
         let is_default = db.default_collection_id().unwrap_or(None) == Some(collection_id);
         self.collection_context_menu_delete.set_enabled(!is_default);
 
@@ -1116,6 +1140,60 @@ impl App {
             return;
         }
         self.refresh_nav_tree();
+    }
+
+    /// The `collection_context_menu`'s Export item: opens the Export Options dialog for the
+    /// collection last right-clicked in `nav_tree` — disabled by `show_collection_context_menu`
+    /// while the collection has no photos yet.
+    fn export_selected_collection(&self) {
+        let Some(collection_id) = self.collection_context_id.borrow_mut().take() else { return };
+        if self.export_options_thread.borrow().is_some() {
+            return;
+        }
+        if self.project.borrow().source_directory.is_none() {
+            nwg::simple_message("PhotoMatic", "Please choose a Source Directory before exporting.");
+            return;
+        }
+
+        *self.export_options_collection_id.borrow_mut() = Some(collection_id);
+        let handle = export_modal::open(self.export_options_notice.sender());
+        *self.export_options_thread.borrow_mut() = Some(handle);
+    }
+
+    /// Fired via `OnNotice` once the Export Options dialog thread finishes. `None` (Cancel or
+    /// the window's own close button) does nothing; `Some` fetches the collection's photos and
+    /// opens the Exporting dialog, which does the actual copy/encode work on its own thread.
+    fn export_options_closed(&self) {
+        let Some(handle) = self.export_options_thread.borrow_mut().take() else { return };
+        let Ok(Some(options)) = handle.join() else { return };
+        let Some(collection_id) = self.export_options_collection_id.borrow_mut().take() else { return };
+        if self.export_progress_thread.borrow().is_some() {
+            return;
+        }
+
+        let (images, source_dir) = {
+            let db = self.db.borrow();
+            let Some(db) = db.as_ref() else { return };
+            let Some(source_dir) = self.project.borrow().source_directory.clone() else { return };
+            (db.collection_images(collection_id).unwrap_or_default(), source_dir)
+        };
+        if images.is_empty() {
+            return;
+        }
+
+        let handle = export_progress_modal::open(images, source_dir, options, self.export_progress_notice.sender());
+        *self.export_progress_thread.borrow_mut() = Some(handle);
+    }
+
+    /// Fired via `OnNotice` once the Exporting dialog (and the background copy/encode work it
+    /// ran) finishes. A fully clean export stays silent, matching `scan_finished`'s lack of a
+    /// success popup — only an abort or per-file errors are reported.
+    fn export_finished(&self) {
+        let Some(handle) = self.export_progress_thread.borrow_mut().take() else { return };
+        let Ok(outcome) = handle.join() else { return };
+        if outcome.aborted || !outcome.errors.is_empty() {
+            nwg::simple_message("PhotoMatic", &export::summary_message(&outcome));
+        }
     }
 
     /// Edit > Add Collection...: opens the dialog with no prefilled fields, validated

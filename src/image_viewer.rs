@@ -881,7 +881,7 @@ fn decode_and_fit(decoder: &nwg::ImageDecoder, path: &Path, frame_size: (u32, u3
 /// filters — see `decode_and_fit`'s doc comment for why this matters: `rotate_frame`'s
 /// `IWICBitmapFlipRotator` needs efficient column-major reads, which only a materialized bitmap
 /// (not a decoder or scaler still consulting one) can give it cheaply.
-fn materialize_bitmap(decoder: &nwg::ImageDecoder, source: &nwg::ImageData) -> Option<nwg::ImageData> {
+pub(crate) fn materialize_bitmap(decoder: &nwg::ImageDecoder, source: &nwg::ImageData) -> Option<nwg::ImageData> {
     use winapi::shared::winerror::S_OK;
     use winapi::um::wincodec::{IWICBitmap, IWICBitmapSource, IWICImagingFactory, WICBitmapCacheOnLoad};
 
@@ -899,7 +899,7 @@ fn materialize_bitmap(decoder: &nwg::ImageDecoder, source: &nwg::ImageData) -> O
 /// and height), unchanged otherwise — used to fit an image *before* rotating it against a
 /// target that accounts for the rotation to come. Kept as a free function, independent of WIC,
 /// so it's unit-testable without either.
-fn swapped_for_rotation(size: (u32, u32), rotation_degrees: i32) -> (u32, u32) {
+pub(crate) fn swapped_for_rotation(size: (u32, u32), rotation_degrees: i32) -> (u32, u32) {
     match rotation_degrees {
         90 | 270 => (size.1, size.0),
         _ => size,
@@ -913,7 +913,7 @@ fn swapped_for_rotation(size: (u32, u32), rotation_degrees: i32) -> (u32, u32) {
 /// it: `nwg::ImageData::frame` and `nwg::ImageDecoder::factory` are `pub` fields specifically
 /// enabling this kind of extension. `None` on any WIC failure, which the caller treats the same
 /// as a decode failure (leaves the image blank, "preview unavailable").
-fn rotate_frame(decoder: &nwg::ImageDecoder, frame: &nwg::ImageData, rotation_degrees: i32) -> Option<nwg::ImageData> {
+pub(crate) fn rotate_frame(decoder: &nwg::ImageDecoder, frame: &nwg::ImageData, rotation_degrees: i32) -> Option<nwg::ImageData> {
     use winapi::shared::winerror::S_OK;
     use winapi::um::wincodec::{
         IWICBitmapFlipRotator, IWICBitmapSource, IWICImagingFactory, WICBitmapTransformRotate0,
