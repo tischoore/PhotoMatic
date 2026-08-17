@@ -20,6 +20,11 @@ pub struct ImageRecord {
     /// `None` if the image sits directly in the project root.
     pub toplevel_dir: Option<String>,
     pub date_taken: Option<NaiveDateTime>,
+    /// The date/time actually used for ordering, Generate Events clustering, and display —
+    /// seeded from `date_taken` by Generate MetaData (see `db::images::update_metadata`) and,
+    /// unlike `date_taken`, independently correctable later without losing the original EXIF
+    /// value.
+    pub corrected_date_taken: Option<NaiveDateTime>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub exposure_time: Option<f64>,

@@ -15,23 +15,23 @@ pub fn haversine_distance_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 
     EARTH_RADIUS_KM * c
 }
 
-/// Groups `images` by `date_taken`: images with no `date_taken` are excluded entirely, the
-/// rest are sorted ascending, then split into groups wherever the gap since the previous photo
-/// exceeds `gap`, or — when `max_distance_km` is `Some` and both photos have GPS coordinates —
-/// the great-circle distance since the previous photo exceeds it. A photo missing GPS data
-/// simply skips the distance check against its neighbor, falling back to time-gap-only
-/// behavior for that pair. Each returned group is sorted ascending and non-empty; groups of
-/// size 1 are still returned here — deciding whether a singleton group counts as a real
-/// "event" is left to the caller.
+/// Groups `images` by `corrected_date_taken`: images with no `corrected_date_taken` are
+/// excluded entirely, the rest are sorted ascending, then split into groups wherever the gap
+/// since the previous photo exceeds `gap`, or — when `max_distance_km` is `Some` and both
+/// photos have GPS coordinates — the great-circle distance since the previous photo exceeds
+/// it. A photo missing GPS data simply skips the distance check against its neighbor, falling
+/// back to time-gap-only behavior for that pair. Each returned group is sorted ascending and
+/// non-empty; groups of size 1 are still returned here — deciding whether a singleton group
+/// counts as a real "event" is left to the caller.
 pub fn cluster_by_time_gap(images: &[ImageRecord], gap: Duration, max_distance_km: Option<f64>) -> Vec<Vec<ImageRecord>> {
-    let mut dated: Vec<ImageRecord> = images.iter().filter(|i| i.date_taken.is_some()).cloned().collect();
-    dated.sort_by_key(|i| i.date_taken.unwrap());
+    let mut dated: Vec<ImageRecord> = images.iter().filter(|i| i.corrected_date_taken.is_some()).cloned().collect();
+    dated.sort_by_key(|i| i.corrected_date_taken.unwrap());
 
     let mut groups: Vec<Vec<ImageRecord>> = Vec::new();
     for image in dated {
         let starts_new_group = match groups.last().and_then(|group| group.last()) {
             Some(prev) => {
-                let time_exceeded = image.date_taken.unwrap() - prev.date_taken.unwrap() > gap;
+                let time_exceeded = image.corrected_date_taken.unwrap() - prev.corrected_date_taken.unwrap() > gap;
                 let distance_exceeded = max_distance_km.is_some_and(|max_km| {
                     match (prev.gps_latitude, prev.gps_longitude, image.gps_latitude, image.gps_longitude) {
                         (Some(lat1), Some(lon1), Some(lat2), Some(lon2)) => {
@@ -65,11 +65,13 @@ mod tests {
     use chrono::NaiveDate;
 
     fn image_at(key: &str, y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> ImageRecord {
+        let when = NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, s);
         ImageRecord {
             key: key.to_string(),
             path: format!("{key}.jpg"),
             image_type: "jpg".to_string(),
-            date_taken: NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, s),
+            date_taken: when,
+            corrected_date_taken: when,
             ..ImageRecord::default()
         }
     }

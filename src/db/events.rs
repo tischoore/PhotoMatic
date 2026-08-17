@@ -84,7 +84,7 @@ pub fn list_events(conn: &Connection) -> Result<Vec<EventSummary>, DbError> {
              JOIN event_images ei ON ei.event_id = e.id \
              JOIN images img ON img.key = ei.image_key \
              GROUP BY e.id \
-             ORDER BY MIN(img.date_taken)",
+             ORDER BY MIN(img.corrected_date_taken)",
         )
         .map_err(DbError::Sqlite)?;
     let rows = stmt
@@ -108,7 +108,7 @@ pub fn event_images(conn: &Connection, event_id: i64) -> Result<Vec<ImageRecord>
         .prepare(&format!(
             "SELECT {IMAGE_COLUMNS} FROM images \
              JOIN event_images ei ON ei.image_key = images.key \
-             WHERE ei.event_id = ?1 ORDER BY images.date_taken"
+             WHERE ei.event_id = ?1 ORDER BY images.corrected_date_taken"
         ))
         .map_err(DbError::Sqlite)?;
     let rows = stmt.query_map(rusqlite::params![event_id], map_image_row).map_err(DbError::Sqlite)?;
@@ -169,11 +169,13 @@ mod tests {
     use chrono::NaiveDate;
 
     fn image_at(key: &str, h: u32, min: u32) -> ImageRecord {
+        let when = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(h, min, 0);
         ImageRecord {
             key: key.to_string(),
             path: format!("{key}.jpg"),
             image_type: "jpg".to_string(),
-            date_taken: NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(h, min, 0),
+            date_taken: when,
+            corrected_date_taken: when,
             ..ImageRecord::default()
         }
     }
@@ -195,18 +197,18 @@ mod tests {
     /// `event_images.image_key` has a foreign key into `images(key)`, so every image
     /// clustered in a test must exist there first — mirrors how `regenerate` is always
     /// called with images that already came from `db.list_images()` in production.
-    /// Also writes `date_taken` back to the row: `upsert_images` alone only stores
-    /// key/path/image_type/toplevel_dir (`date_taken` normally arrives later via
-    /// `update_metadata`), but `list_events`/`event_images` join against the `images`
-    /// table's `date_taken`, not the in-memory `ImageRecord`s `regenerate` clusters —
-    /// mirroring how, in production, `db.list_images()` (regenerate's actual image
-    /// source) only ever has a `date_taken` once metadata extraction already wrote it.
+    /// Also writes `date_taken`/`corrected_date_taken` back to the row: `upsert_images` alone
+    /// only stores key/path/image_type/toplevel_dir (both normally arrive later via
+    /// `update_metadata`), but `list_events`/`event_images` join against the `images` table's
+    /// `corrected_date_taken`, not the in-memory `ImageRecord`s `regenerate` clusters —
+    /// mirroring how, in production, `db.list_images()` (regenerate's actual image source)
+    /// only ever has one once metadata extraction already wrote it.
     fn seed_images(conn: &mut Connection, images: &[ImageRecord]) {
         crate::db::images::upsert_images(conn, images).unwrap();
         for image in images {
             conn.execute(
-                "UPDATE images SET date_taken = ?2 WHERE key = ?1",
-                rusqlite::params![image.key, image.date_taken],
+                "UPDATE images SET date_taken = ?2, corrected_date_taken = ?3 WHERE key = ?1",
+                rusqlite::params![image.key, image.date_taken, image.corrected_date_taken],
             )
             .unwrap();
         }
@@ -279,14 +281,10 @@ mod tests {
         crate::db::migrations::apply(&mut conn).unwrap();
 
         // Two shots 5 seconds apart: a Tight Burst, a Session, and a Multi-hour group all at once.
-        let a = ImageRecord {
-            date_taken: NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(10, 0, 0),
-            ..image_at("a", 10, 0)
-        };
-        let b = ImageRecord {
-            date_taken: NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(10, 0, 5),
-            ..image_at("b", 10, 0)
-        };
+        let a_when = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(10, 0, 0);
+        let a = ImageRecord { date_taken: a_when, corrected_date_taken: a_when, ..image_at("a", 10, 0) };
+        let b_when = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(10, 0, 5);
+        let b = ImageRecord { date_taken: b_when, corrected_date_taken: b_when, ..image_at("b", 10, 0) };
         seed_images(&mut conn, &[a.clone(), b.clone()]);
         regenerate(&mut conn, &[a, b], &thresholds()).unwrap();
 
@@ -321,19 +319,15 @@ mod tests {
 
         // 5 seconds apart clears Tight Burst too, so the same pair is clustered at all three
         // tiers, but Copenhagen -> Aarhus (~157km) exceeds the Session/Multi-hour distance cap.
+        let a_when = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(10, 0, 0);
         let a = with_gps(
-            ImageRecord {
-                date_taken: NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(10, 0, 0),
-                ..image_at("a", 10, 0)
-            },
+            ImageRecord { date_taken: a_when, corrected_date_taken: a_when, ..image_at("a", 10, 0) },
             55.6761,
             12.5683,
         );
+        let b_when = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(10, 0, 5);
         let b = with_gps(
-            ImageRecord {
-                date_taken: NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(10, 0, 5),
-                ..image_at("b", 10, 0)
-            },
+            ImageRecord { date_taken: b_when, corrected_date_taken: b_when, ..image_at("b", 10, 0) },
             56.1629,
             10.2039,
         );
@@ -380,16 +374,7 @@ mod tests {
         // Session -> Multi-hour, so Y's Session event is inserted (id 1) before X's
         // Multi-hour event (id 2) — even though X's photos are chronologically earlier.
         // list_events must still list X's event first.
-        let x = vec![
-            ImageRecord {
-                date_taken: NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(8, 0, 0),
-                ..image_at("x-a", 8, 0)
-            },
-            ImageRecord {
-                date_taken: NaiveDate::from_ymd_opt(2026, 7, 15).unwrap().and_hms_opt(10, 0, 0),
-                ..image_at("x-b", 10, 0)
-            },
-        ];
+        let x = vec![image_at("x-a", 8, 0), image_at("x-b", 10, 0)];
         let y = vec![image_at("y-a", 20, 0), image_at("y-b", 20, 30)];
         let all: Vec<ImageRecord> = x.iter().chain(y.iter()).cloned().collect();
         seed_images(&mut conn, &all);

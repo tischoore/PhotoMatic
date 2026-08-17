@@ -166,7 +166,7 @@ pub fn collection_images(conn: &Connection, collection_id: i64) -> Result<Vec<Im
         .prepare(&format!(
             "SELECT {IMAGE_COLUMNS} FROM images \
              JOIN collection_images ci ON ci.image_key = images.key \
-             WHERE ci.collection_id = ?1 ORDER BY images.date_taken"
+             WHERE ci.collection_id = ?1 ORDER BY images.corrected_date_taken"
         ))
         .map_err(DbError::Sqlite)?;
     let rows = stmt.query_map(rusqlite::params![collection_id], map_image_row).map_err(DbError::Sqlite)?;
@@ -472,11 +472,11 @@ mod tests {
     }
 
     #[test]
-    fn collection_images_orders_by_date_taken() {
+    fn collection_images_orders_by_corrected_date_taken() {
         let mut conn = migrated_conn();
         upsert_images(&mut conn, &[image("a", "a.jpg"), image("b", "b.jpg")]).unwrap();
-        conn.execute("UPDATE images SET date_taken = '2026-01-02 00:00:00' WHERE key = 'a'", []).unwrap();
-        conn.execute("UPDATE images SET date_taken = '2026-01-01 00:00:00' WHERE key = 'b'", []).unwrap();
+        conn.execute("UPDATE images SET corrected_date_taken = '2026-01-02 00:00:00' WHERE key = 'a'", []).unwrap();
+        conn.execute("UPDATE images SET corrected_date_taken = '2026-01-01 00:00:00' WHERE key = 'b'", []).unwrap();
         let id = create_collection(&conn, "Trip A", "First", "a").unwrap();
         add_image_to_collection(&conn, id, "a").unwrap();
         add_image_to_collection(&conn, id, "b").unwrap();

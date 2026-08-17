@@ -35,9 +35,9 @@ pub fn upsert_images(conn: &mut Connection, images: &[ImageRecord]) -> Result<()
 /// Visible to the rest of `db` (in particular `db::events`'s `event_images` query) so an
 /// event's photo table can be built with the same column set/order as every other
 /// `ImageRecord` query, without duplicating it.
-pub(super) const IMAGE_COLUMNS: &str = "key, path, image_type, toplevel_dir, date_taken, width, height, \
-     exposure_time, iso, focal_length, gps_latitude, gps_longitude, gps_altitude, metadata_read_at, linked_key, \
-     rotation, color_black_r, color_black_g, color_black_b, color_white_r, color_white_g, color_white_b";
+pub(super) const IMAGE_COLUMNS: &str = "key, path, image_type, toplevel_dir, date_taken, corrected_date_taken, \
+     width, height, exposure_time, iso, focal_length, gps_latitude, gps_longitude, gps_altitude, metadata_read_at, \
+     linked_key, rotation, color_black_r, color_black_g, color_black_b, color_white_r, color_white_g, color_white_b";
 
 pub(super) fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord> {
     Ok(ImageRecord {
@@ -46,23 +46,24 @@ pub(super) fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord
         image_type: row.get(2)?,
         toplevel_dir: row.get(3)?,
         date_taken: row.get(4)?,
-        width: row.get(5)?,
-        height: row.get(6)?,
-        exposure_time: row.get(7)?,
-        iso: row.get(8)?,
-        focal_length: row.get(9)?,
-        gps_latitude: row.get(10)?,
-        gps_longitude: row.get(11)?,
-        gps_altitude: row.get(12)?,
-        metadata_read_at: row.get(13)?,
-        linked_key: row.get(14)?,
-        rotation: row.get(15)?,
-        color_black_r: row.get(16)?,
-        color_black_g: row.get(17)?,
-        color_black_b: row.get(18)?,
-        color_white_r: row.get(19)?,
-        color_white_g: row.get(20)?,
-        color_white_b: row.get(21)?,
+        corrected_date_taken: row.get(5)?,
+        width: row.get(6)?,
+        height: row.get(7)?,
+        exposure_time: row.get(8)?,
+        iso: row.get(9)?,
+        focal_length: row.get(10)?,
+        gps_latitude: row.get(11)?,
+        gps_longitude: row.get(12)?,
+        gps_altitude: row.get(13)?,
+        metadata_read_at: row.get(14)?,
+        linked_key: row.get(15)?,
+        rotation: row.get(16)?,
+        color_black_r: row.get(17)?,
+        color_black_g: row.get(18)?,
+        color_black_b: row.get(19)?,
+        color_white_r: row.get(20)?,
+        color_white_g: row.get(21)?,
+        color_white_b: row.get(22)?,
     })
 }
 
@@ -93,8 +94,8 @@ pub fn list_images_pending_metadata(conn: &Connection) -> Result<Vec<ImageRecord
 /// all is only ever opened and parsed once.
 pub fn update_metadata(conn: &Connection, key: &str, metadata: &crate::exif::ImageMetadata) -> Result<(), DbError> {
     conn.execute(
-        "UPDATE images SET date_taken = ?2, width = ?3, height = ?4, exposure_time = ?5, iso = ?6, \
-         focal_length = ?7, gps_latitude = ?8, gps_longitude = ?9, gps_altitude = ?10, \
+        "UPDATE images SET date_taken = ?2, corrected_date_taken = ?2, width = ?3, height = ?4, exposure_time = ?5, \
+         iso = ?6, focal_length = ?7, gps_latitude = ?8, gps_longitude = ?9, gps_altitude = ?10, \
          metadata_read_at = ?11 WHERE key = ?1",
         rusqlite::params![
             key,
@@ -128,8 +129,9 @@ pub fn count_by_directory_and_type(conn: &Connection) -> Result<Vec<(Option<Stri
 }
 
 /// Images under a specific top-level directory, optionally filtered to one File Type
-/// extension, sorted by path — backs the Left Navigation tree's "Image List" context
-/// menu action.
+/// extension, sorted chronologically by `corrected_date_taken` (falling back to `path` when
+/// dates tie or are still unset, e.g. before Generate MetaData has run) — backs the Left
+/// Navigation tree's "Image List" context menu action.
 pub fn list_images_by_directory(
     conn: &Connection,
     toplevel_dir: &str,
@@ -137,7 +139,8 @@ pub fn list_images_by_directory(
 ) -> Result<Vec<ImageRecord>, DbError> {
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT {IMAGE_COLUMNS} FROM images WHERE toplevel_dir = ?1 AND (?2 IS NULL OR image_type = ?2) ORDER BY path"
+            "SELECT {IMAGE_COLUMNS} FROM images WHERE toplevel_dir = ?1 AND (?2 IS NULL OR image_type = ?2) \
+             ORDER BY corrected_date_taken, path"
         ))
         .map_err(DbError::Sqlite)?;
     let rows = stmt

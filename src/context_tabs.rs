@@ -1,9 +1,10 @@
 use crate::db::models::ImageRecord;
 
 /// Column headers, in display order, paired with a pixel width for `ListView::insert_column`.
-pub const COLUMNS: [(&str, i32); 9] = [
+pub const COLUMNS: [(&str, i32); 10] = [
     ("Path", 320),
     ("Date taken", 150),
+    ("Corrected date taken", 150),
     ("Width", 70),
     ("Height", 70),
     ("Focal length", 100),
@@ -31,12 +32,13 @@ pub fn event_tab_title(event_id: i64) -> String {
     format!("Event #{event_id}")
 }
 
-/// One `ImageRecord` as the 9 display strings, in `COLUMNS` order. `None` fields render
+/// One `ImageRecord` as the 10 display strings, in `COLUMNS` order. `None` fields render
 /// as an empty string (blank cell) rather than a placeholder like "N/A".
-pub fn image_row(record: &ImageRecord) -> [String; 9] {
+pub fn image_row(record: &ImageRecord) -> [String; 10] {
     [
         record.path.clone(),
         record.date_taken.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default(),
+        record.corrected_date_taken.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default(),
         record.width.map(|w| w.to_string()).unwrap_or_default(),
         record.height.map(|h| h.to_string()).unwrap_or_default(),
         record.focal_length.map(|f| format!("{f:.1}mm")).unwrap_or_default(),
@@ -100,6 +102,7 @@ mod tests {
             image_type: "jpg".to_string(),
             toplevel_dir: Some("50D".to_string()),
             date_taken: NaiveDate::from_ymd_opt(2024, 3, 5).unwrap().and_hms_opt(14, 30, 0),
+            corrected_date_taken: NaiveDate::from_ymd_opt(2024, 3, 6).unwrap().and_hms_opt(9, 15, 0),
             width: Some(6000),
             height: Some(4000),
             exposure_time: Some(0.008),
@@ -123,6 +126,7 @@ mod tests {
             [
                 "50D/a.jpg".to_string(),
                 "2024-03-05 14:30:00".to_string(),
+                "2024-03-06 09:15:00".to_string(),
                 "6000".to_string(),
                 "4000".to_string(),
                 "50.0mm".to_string(),
@@ -142,6 +146,7 @@ mod tests {
             image_type: "jpg".to_string(),
             toplevel_dir: Some("50D".to_string()),
             date_taken: None,
+            corrected_date_taken: None,
             width: None,
             height: None,
             exposure_time: None,
@@ -164,6 +169,7 @@ mod tests {
             image_row(&record),
             [
                 "50D/a.jpg".to_string(),
+                String::new(),
                 String::new(),
                 String::new(),
                 String::new(),

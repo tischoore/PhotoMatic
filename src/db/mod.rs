@@ -421,7 +421,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 13);
+        assert_eq!(db.schema_version().unwrap(), 14);
 
         std::fs::remove_file(&path).ok();
     }
@@ -647,6 +647,35 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[test]
+    fn list_images_by_directory_orders_by_corrected_date_taken_rather_than_path() {
+        let path = temp_db_path("list-images-by-directory-date-order");
+        std::fs::remove_file(&path).ok();
+        let mut db = ProjectDb::open(&path).unwrap();
+
+        apply_units(
+            &mut db,
+            &[ScanUnit::ToplevelDir {
+                name: "50D".to_string(),
+                files: vec![
+                    ScannedFile { relative_path: PathBuf::from("50D").join("a.jpg"), extension: "jpg".to_string(), toplevel_dir: Some("50D".to_string()) },
+                    ScannedFile { relative_path: PathBuf::from("50D").join("b.jpg"), extension: "jpg".to_string(), toplevel_dir: Some("50D".to_string()) },
+                ],
+            }],
+        );
+        // "a.jpg" sorts first by path, but is the more recent photo — the directory listing
+        // should follow corrected_date_taken, not path.
+        db.conn.execute("UPDATE images SET corrected_date_taken = '2026-01-02 00:00:00' WHERE path = '50D/a.jpg'", []).unwrap();
+        db.conn.execute("UPDATE images SET corrected_date_taken = '2026-01-01 00:00:00' WHERE path = '50D/b.jpg'", []).unwrap();
+
+        let paths: Vec<String> =
+            db.list_images_by_directory("50D", None).unwrap().iter().map(|i| i.path.clone()).collect();
+
+        assert_eq!(paths, vec!["50D/b.jpg".to_string(), "50D/a.jpg".to_string()]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
     /// Mirrors `read_metadata`'s output for a fully-tagged JPEG.
     fn sample_metadata() -> exif::ImageMetadata {
         exif::ImageMetadata {
@@ -695,6 +724,7 @@ mod tests {
         let images = db.list_images().unwrap();
         let image = images.iter().find(|i| i.path == "a.jpg").unwrap();
         assert_eq!(image.date_taken, metadata.date_taken);
+        assert_eq!(image.corrected_date_taken, metadata.date_taken);
         assert_eq!(image.width, metadata.width);
         assert_eq!(image.height, metadata.height);
         assert_eq!(image.exposure_time, metadata.exposure_time_seconds);

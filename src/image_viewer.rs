@@ -1313,7 +1313,7 @@ fn prefetch_targets(current: usize, len: usize) -> Vec<usize> {
 /// `context_tabs`'s exposure time/GPS formatting so the same photo reads identically here and
 /// in the photo table.
 fn format_metadata(record: &ImageRecord) -> String {
-    let date_taken = record.date_taken.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+    let date_taken = record.corrected_date_taken.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
     let metadata_read_at =
         record.metadata_read_at.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
 

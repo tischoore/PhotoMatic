@@ -19,7 +19,8 @@ fn migrations() -> &'static Migrations<'static> {
             M::up(include_str!("migrations/0011_add_image_rotation.sql")),
             M::up(include_str!("migrations/0012_add_collection_current_image.sql")),
             M::up(include_str!("migrations/0013_add_image_color_correction.sql")),
-            // M::up(include_str!("migrations/0014_....sql")),  <- next migration goes here
+            M::up(include_str!("migrations/0014_add_image_corrected_date_taken.sql")),
+            // M::up(include_str!("migrations/0015_....sql")),  <- next migration goes here
         ])
     })
 }
@@ -89,5 +90,56 @@ mod tests {
         let result = conn.execute("INSERT INTO collections (name, description, shortcut) VALUES ('B', '', 'x')", []);
 
         assert!(result.is_err());
+    }
+
+    /// Migrations through 0013 only — a database that already existed before
+    /// `corrected_date_taken` (migration 0014) was added, with a `date_taken` already
+    /// populated by an earlier Generate MetaData run.
+    fn migrations_through_0013() -> Migrations<'static> {
+        Migrations::new(vec![
+            M::up(include_str!("migrations/0001_initial.sql")),
+            M::up(include_str!("migrations/0002_add_image_toplevel_dir.sql")),
+            M::up(include_str!("migrations/0003_add_image_exif_metadata.sql")),
+            M::up(include_str!("migrations/0004_add_events.sql")),
+            M::up(include_str!("migrations/0005_add_image_gps.sql")),
+            M::up(include_str!("migrations/0006_reset_metadata_read_at_for_gps_backfill.sql")),
+            M::up(include_str!("migrations/0007_add_event_title.sql")),
+            M::up(include_str!("migrations/0008_add_image_linked_key.sql")),
+            M::up(include_str!("migrations/0009_add_collections.sql")),
+            M::up(include_str!("migrations/0010_add_collection_shortcut.sql")),
+            M::up(include_str!("migrations/0011_add_image_rotation.sql")),
+            M::up(include_str!("migrations/0012_add_collection_current_image.sql")),
+            M::up(include_str!("migrations/0013_add_image_color_correction.sql")),
+        ])
+    }
+
+    #[test]
+    fn upgrading_a_pre_corrected_date_taken_database_backfills_it_from_date_taken() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrations_through_0013().to_latest(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO images (key, path, image_type, date_taken) VALUES ('a', 'a.jpg', 'jpg', '2026-01-02 03:04:05')",
+            [],
+        )
+        .unwrap();
+
+        apply(&mut conn).unwrap();
+
+        let corrected_date_taken: String =
+            conn.query_row("SELECT corrected_date_taken FROM images WHERE key = 'a'", [], |row| row.get(0)).unwrap();
+        assert_eq!(corrected_date_taken, "2026-01-02 03:04:05");
+    }
+
+    #[test]
+    fn upgrading_a_pre_corrected_date_taken_database_leaves_an_undated_image_null() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrations_through_0013().to_latest(&mut conn).unwrap();
+        conn.execute("INSERT INTO images (key, path, image_type) VALUES ('a', 'a.jpg', 'jpg')", []).unwrap();
+
+        apply(&mut conn).unwrap();
+
+        let corrected_date_taken: Option<String> =
+            conn.query_row("SELECT corrected_date_taken FROM images WHERE key = 'a'", [], |row| row.get(0)).unwrap();
+        assert_eq!(corrected_date_taken, None);
     }
 }
