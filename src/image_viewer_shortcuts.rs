@@ -26,15 +26,20 @@ pub fn resolve(key: u32, ctrl: bool) -> Option<ViewerAction> {
     }
 }
 
-/// Whether a raw Win32 message is a Left/Right arrow key-down that must bypass
+/// Whether a raw Win32 message is a Left/Right-arrow or Return key-down that must bypass
 /// `IsDialogMessageW`'s dialog-navigation handling so it reaches `OnKeyPress` (see
 /// `ImageViewer::open`'s message loop) — `IsDialogMessageW` otherwise consumes arrow keys
 /// to cycle keyboard focus between the viewer's buttons/checkboxes before `resolve` ever
 /// sees them, which is why Left/Right silently did nothing despite `resolve` already
-/// mapping them correctly.
+/// mapping them correctly. Return needs the same treatment for the same reason: with no
+/// default pushbutton configured in this window, `IsDialogMessageW` simply swallows Enter
+/// when a non-button control (the Image Nr box) has focus instead of passing it through, so
+/// `ImageViewer::jump_to_image_number` never fired without this bypass.
 pub fn bypasses_dialog_navigation(message: u32, virtual_key: usize) -> bool {
     message == winapi::um::winuser::WM_KEYDOWN
-        && (virtual_key == nwg::keys::LEFT as usize || virtual_key == nwg::keys::RIGHT as usize)
+        && (virtual_key == nwg::keys::LEFT as usize
+            || virtual_key == nwg::keys::RIGHT as usize
+            || virtual_key == nwg::keys::RETURN as usize)
 }
 
 /// Maps a plain (non-Ctrl) key press to the id of the collection whose shortcut it matches.
@@ -97,6 +102,11 @@ mod tests {
     fn left_and_right_arrow_keydown_bypass_dialog_navigation() {
         assert!(bypasses_dialog_navigation(winapi::um::winuser::WM_KEYDOWN, nwg::keys::LEFT as usize));
         assert!(bypasses_dialog_navigation(winapi::um::winuser::WM_KEYDOWN, nwg::keys::RIGHT as usize));
+    }
+
+    #[test]
+    fn return_keydown_bypasses_dialog_navigation() {
+        assert!(bypasses_dialog_navigation(winapi::um::winuser::WM_KEYDOWN, nwg::keys::RETURN as usize));
     }
 
     #[test]

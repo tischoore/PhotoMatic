@@ -40,6 +40,10 @@ const ROTATE_BUTTON_WIDTH: f32 = 70.0;
 const AUTO_CORRECT_BUTTON_WIDTH: f32 = 100.0;
 /// Width of one collection toggle button — just its shortcut letter, so this stays narrow.
 const COLLECTION_BUTTON_WIDTH: f32 = 40.0;
+/// Width of the "Image Nr:" label, next to Prev/Next.
+const IMAGE_NR_LABEL_WIDTH: f32 = 60.0;
+/// Width of the Image Nr input box — just enough digits for a large project's photo count.
+const IMAGE_NR_INPUT_WIDTH: f32 = 50.0;
 
 /// Opens the Image Viewer on its own thread for one event's or collection's photos, starting
 /// at `start_index`. The window's title is a snapshot of `title` at open time — unlike an
@@ -103,12 +107,15 @@ pub fn open(
 
         // Not a plain `nwg::dispatch_thread_events()`: that call routes every message through
         // `IsDialogMessageW`, Win32's dialog-navigation helper, which consumes Left/Right
-        // arrow key-downs to cycle keyboard focus between this window's buttons/checkboxes
-        // before they ever reach `OnKeyPress` — so `image_viewer_shortcuts::resolve` never
-        // saw them, no matter how the event handler was wired. Arrow key-downs are diverted
-        // straight to dispatch instead; every other message (Tab/Enter/Esc, etc.) still goes
-        // through `IsDialogMessageW` exactly as before, so normal dialog-style focus
-        // navigation between controls is unaffected.
+        // arrow key-downs (to cycle keyboard focus between this window's buttons/checkboxes)
+        // and Return key-downs (there's no default pushbutton configured, so with no button to
+        // simulate a click on, `IsDialogMessageW` just swallows Enter when a non-button control
+        // like the Image Nr box has focus) before they ever reach `OnKeyPress` — so neither
+        // `image_viewer_shortcuts::resolve` nor `jump_to_image_number` ever saw them, no matter
+        // how the event handler was wired. Those key-downs are diverted straight to dispatch
+        // instead; every other message (Tab/Esc, etc.) still goes through `IsDialogMessageW`
+        // exactly as before, so normal dialog-style focus navigation between controls is
+        // unaffected.
         unsafe {
             let mut msg: winapi::um::winuser::MSG = std::mem::zeroed();
             while winapi::um::winuser::GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) != 0 {
@@ -236,6 +243,14 @@ pub struct ImageViewer {
     #[nwg_events(OnMenuItemSelected: [ImageViewer::show_metadata])]
     edit_metadata: nwg::MenuItem,
 
+    /// Resets the displayed photo's `corrected_date_taken` back to `date_taken`, undoing any
+    /// per-directory shift a Set Time Correction run applied to it (`clear_time_correction`).
+    /// No accelerator per `CLAUDE.md`: no Windows-standard key combination exists for this
+    /// action, so mnemonic only — `C` is free, since this menu's only other item uses `M`.
+    #[nwg_control(parent: edit_menu, text: "&Clear Time Correction")]
+    #[nwg_events(OnMenuItemSelected: [ImageViewer::clear_time_correction])]
+    edit_clear_time_correction: nwg::MenuItem,
+
     #[nwg_control(parent: window, text: "&Help")]
     help_menu: nwg::Menu,
 
@@ -253,6 +268,23 @@ pub struct ImageViewer {
     #[nwg_control(parent: window, text: "Ne&xt")]
     #[nwg_events(OnButtonClick: [ImageViewer::next])]
     next_button: nwg::Button,
+
+    /// Plain descriptive text, no mnemonic — matches every other label paired with a numeric
+    /// input elsewhere in the app (e.g. `app.rs`'s "Event Gaps:"). Win32 mnemonics only apply to
+    /// buttons/menu items/checkboxes, not text fields, so there's no accelerator to give this
+    /// pairing beyond the input's own Tab-order reachability.
+    #[nwg_control(parent: window, text: "Image Nr:")]
+    image_nr_label: nwg::Label,
+
+    /// Jumping straight to a photo by its 1-based position, for quickly reaching the start or
+    /// end of a long list without holding Prev/Next. Committed on Enter (`jump_to_image_number`,
+    /// wired via `handle`-checked `OnKeyPress` in `setup` so Left/Right/Delete/collection-letter
+    /// shortcuts don't fire while typing here); kept in sync with the current photo by
+    /// `show_current_image` on every navigation, so an invalid or abandoned entry snaps back
+    /// rather than sitting there unresolved. No accelerator per `CLAUDE.md`: a text field's
+    /// Enter-to-commit is inherent control behavior, not an invented key binding.
+    #[nwg_control(parent: window)]
+    image_nr_input: nwg::TextInput,
 
     /// Enabled only when the current photo has a linked RAW/compressed counterpart. A static
     /// label rather than state-describing text ("Show RAW"/"Show JPG") so its mnemonic never
@@ -345,7 +377,7 @@ impl ImageViewer {
         let handler = nwg::full_bind_event_handler(&app.window.handle, move |evt, evt_data, handle| {
             let Some(app) = app_weak.upgrade() else { return };
             match evt {
-                nwg::Event::OnKeyPress => app.on_key_press(&evt_data),
+                nwg::Event::OnKeyPress => app.on_key_press(&evt_data, handle),
                 nwg::Event::OnButtonClick => {
                     let collection_id =
                         app.collection_buttons.borrow().iter().find(|(cb, _)| cb.handle == handle).map(|(_, id)| *id);
@@ -411,6 +443,10 @@ impl ImageViewer {
             .child_size(Size { width: D::Points(NAV_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .child(&self.next_button)
             .child_size(Size { width: D::Points(NAV_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
+            .child(&self.image_nr_label)
+            .child_size(Size { width: D::Points(IMAGE_NR_LABEL_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
+            .child(&self.image_nr_input)
+            .child_size(Size { width: D::Points(IMAGE_NR_INPUT_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .child(&self.toggle_raw_button)
             .child_size(Size { width: D::Points(TOGGLE_RAW_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .child(&self.delete_button)
@@ -453,9 +489,22 @@ impl ImageViewer {
         self.show_current_image();
     }
 
-    fn on_key_press(&self, data: &nwg::EventData) {
-        let ctrl = keyboard::key_down(winapi::um::winuser::VK_CONTROL);
+    /// `handle` is whichever control actually received the keystroke — needed so a keypress
+    /// while `image_nr_input` has focus (typing digits, moving the caret with Left/Right,
+    /// Backspace) is treated as ordinary text editing rather than Prev/Next/Delete/collection-
+    /// shortcut navigation, which would otherwise fire too since `setup`'s `full_bind_event_handler`
+    /// hook sees every control's keystrokes regardless of focus. Only Enter is special-cased
+    /// there, to commit the typed image number (`jump_to_image_number`).
+    fn on_key_press(&self, data: &nwg::EventData, handle: nwg::ControlHandle) {
         let key = data.on_key();
+        if handle == self.image_nr_input.handle {
+            if key == nwg::keys::RETURN {
+                self.jump_to_image_number();
+            }
+            return;
+        }
+
+        let ctrl = keyboard::key_down(winapi::um::winuser::VK_CONTROL);
         match image_viewer_shortcuts::resolve(key, ctrl) {
             Some(ViewerAction::Close) => return self.close(),
             Some(ViewerAction::Prev) => return self.prev(),
@@ -499,6 +548,21 @@ impl ImageViewer {
         *index += 1;
         drop(index);
         *self.showing_counterpart.borrow_mut() = false;
+        self.show_current_image();
+    }
+
+    /// The Image Nr box's Enter key: if its text names a valid 1-based position among the
+    /// current photo list (`parse_target_image_number`), jumps there — resetting Toggle RAW back
+    /// to the native photo, same as `prev`/`next`. An invalid entry (out of range, non-numeric,
+    /// empty) leaves `current_index` untouched. Either way `show_current_image` re-syncs the
+    /// box's text to whatever the current photo actually is, so an invalid entry snaps back
+    /// rather than sitting there unresolved.
+    fn jump_to_image_number(&self) {
+        let count = self.images.borrow().len();
+        if let Some(index) = parse_target_image_number(&self.image_nr_input.text(), count) {
+            *self.current_index.borrow_mut() = index;
+            *self.showing_counterpart.borrow_mut() = false;
+        }
         self.show_current_image();
     }
 
@@ -548,6 +612,7 @@ impl ImageViewer {
 
         let suffix = if bitmap.is_some() { "" } else { " \u{2014} preview unavailable" };
         self.status_label.set_text(&format!("{} ({} of {}){}", record.path, index + 1, images.len(), suffix));
+        self.image_nr_input.set_text(&(index + 1).to_string());
         self.image_frame.set_bitmap(bitmap);
         drop(cache);
 
@@ -754,6 +819,46 @@ impl ImageViewer {
         self.image_cache.borrow_mut().clear();
         self.prefetch_in_flight.borrow_mut().clear();
         self.show_current_image();
+    }
+
+    /// Edit > Clear Time Correction: resets the displayed photo's (native, or its RAW/compressed
+    /// counterpart if Toggle RAW is active — same `record_to_display` scope `rotate_current_image`
+    /// uses) `corrected_date_taken` back to its original `date_taken`, undoing any shift a Set
+    /// Time Correction run applied to it. Takes effect immediately with no confirmation, the same
+    /// as unchecking Auto Correct — unlike Delete, this only ever touches one field on one row, so
+    /// there's nothing destructive enough to warrant asking first. No bitmap is affected, so unlike
+    /// `rotate_current_image` there's no cache to invalidate or redraw to trigger; only the
+    /// in-memory record is kept in sync so a subsequently opened Meta Data dialog reflects it.
+    fn clear_time_correction(&self) {
+        let index = *self.current_index.borrow();
+        let showing_counterpart = *self.showing_counterpart.borrow();
+
+        let key = {
+            let images = self.images.borrow();
+            let linked_images = self.linked_images.borrow();
+            let Some(record) = record_to_display(&images, &linked_images, index, showing_counterpart) else { return };
+            record.key.clone()
+        };
+
+        let db_path = self.db_path.borrow().clone();
+        let db = match db::ProjectDb::open(&db_path) {
+            Ok(db) => db,
+            Err(err) => {
+                nwg::simple_message("PhotoMatic", &format!("Failed to open the database: {err}"));
+                return;
+            }
+        };
+        if let Err(err) = db.clear_image_time_correction(&key) {
+            nwg::simple_message("PhotoMatic", &format!("Failed to clear time correction: {err}"));
+            return;
+        }
+
+        if let Some(record) = self.images.borrow_mut().iter_mut().find(|r| r.key == key) {
+            record.corrected_date_taken = record.date_taken;
+        }
+        if let Some(record) = self.linked_images.borrow_mut().values_mut().find(|r| r.key == key) {
+            record.corrected_date_taken = record.date_taken;
+        }
     }
 
     /// Sets the Auto Correct checkbox's checked state from whether `record` currently has a
@@ -1099,7 +1204,7 @@ struct AutoCorrectResult {
 /// - Materializing the scaled result into a real, randomly-accessible `IWICBitmap` first (rather
 ///   than leaving it as a lazy scaler chain) fixes this at the source: the rotator then reads
 ///   from an actual pixel buffer, not a decoder, regardless of access pattern.
-fn decode_and_fit(
+pub(crate) fn decode_and_fit(
     decoder: &nwg::ImageDecoder,
     path: &Path,
     frame_size: (u32, u32),
@@ -1398,6 +1503,19 @@ pub fn start_index_for_current_img(images: &[ImageRecord], current_img: Option<&
     current_img.and_then(|key| images.iter().position(|r| r.key == key)).unwrap_or(0)
 }
 
+/// Parses the Image Nr box's text as a 1-based photo position and, if it names a valid one
+/// among `image_count` photos, returns the corresponding 0-based index — `jump_to_image_number`'s
+/// core logic. `None` for anything that doesn't land in `1..=image_count` (non-numeric, empty,
+/// zero, too large, or `image_count == 0`), so the caller can leave the current photo unchanged.
+/// Kept as a free function so this is unit-testable without a window.
+fn parse_target_image_number(text: &str, image_count: usize) -> Option<usize> {
+    let number: usize = text.trim().parse().ok()?;
+    if number == 0 || number > image_count {
+        return None;
+    }
+    Some(number - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1457,6 +1575,42 @@ mod tests {
     #[test]
     fn index_after_removal_is_none_when_list_becomes_empty() {
         assert_eq!(index_after_removal(0, 1), None);
+    }
+
+    #[test]
+    fn parse_target_image_number_accepts_the_first_and_last_valid_position() {
+        assert_eq!(parse_target_image_number("1", 5), Some(0));
+        assert_eq!(parse_target_image_number("5", 5), Some(4));
+    }
+
+    #[test]
+    fn parse_target_image_number_trims_surrounding_whitespace() {
+        assert_eq!(parse_target_image_number("  3  ", 5), Some(2));
+    }
+
+    #[test]
+    fn parse_target_image_number_rejects_zero() {
+        assert_eq!(parse_target_image_number("0", 5), None);
+    }
+
+    #[test]
+    fn parse_target_image_number_rejects_a_position_past_the_end() {
+        assert_eq!(parse_target_image_number("6", 5), None);
+    }
+
+    #[test]
+    fn parse_target_image_number_rejects_non_numeric_text() {
+        assert_eq!(parse_target_image_number("abc", 5), None);
+    }
+
+    #[test]
+    fn parse_target_image_number_rejects_empty_text() {
+        assert_eq!(parse_target_image_number("", 5), None);
+    }
+
+    #[test]
+    fn parse_target_image_number_rejects_everything_when_there_are_no_images() {
+        assert_eq!(parse_target_image_number("1", 0), None);
     }
 
     #[test]

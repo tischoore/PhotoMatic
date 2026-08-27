@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
-use chrono::{NaiveDate, Utc};
+use chrono::{Duration, NaiveDate, Utc};
 use rusqlite::Connection;
 
 use crate::exif;
@@ -188,6 +188,13 @@ impl ProjectDb {
         images::update_metadata(&self.conn, key, metadata)
     }
 
+    /// Shifts `corrected_date_taken` by each `(toplevel_dir, offset)` pair's offset, for every
+    /// dated row under that directory, in one transaction — backs the Set Time Correction
+    /// dialog's Accept button.
+    pub fn apply_time_corrections(&mut self, corrections: &[(Option<String>, Duration)]) -> Result<(), DbError> {
+        images::apply_time_corrections(&mut self.conn, corrections)
+    }
+
     /// Per-directory, per-extension image counts backing the Left Navigation tree.
     pub fn directory_type_counts(&self) -> Result<Vec<(Option<String>, String, i64)>, DbError> {
         images::count_by_directory_and_type(&self.conn)
@@ -339,6 +346,18 @@ impl ProjectDb {
     /// checkbox being unchecked.
     pub fn clear_image_color_correction(&self, key: &str) -> Result<(), DbError> {
         images::clear_color_correction(&self.conn, key)
+    }
+
+    /// Resets one image's `corrected_date_taken` back to its original `date_taken` — the Image
+    /// Viewer's Edit > Clear Time Correction.
+    pub fn clear_image_time_correction(&self, key: &str) -> Result<(), DbError> {
+        images::clear_time_correction(&self.conn, key)
+    }
+
+    /// Resets every image's `corrected_date_taken` back to its original `date_taken` — the main
+    /// window's Edit > Clear All Time Correction.
+    pub fn clear_all_time_corrections(&self) -> Result<(), DbError> {
+        images::clear_all_time_corrections(&self.conn)
     }
 
     /// Removes one image from every collection it belongs to, default collection included —

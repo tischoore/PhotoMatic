@@ -1,3 +1,4 @@
+use chrono::{Duration, NaiveDateTime};
 use rusqlite::Connection;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -227,6 +228,23 @@ pub fn clear_color_correction(conn: &Connection, key: &str) -> Result<(), DbErro
     Ok(())
 }
 
+/// Resets one photo's `corrected_date_taken` back to its original `date_taken` — backs the
+/// Image Viewer's Edit > Clear Time Correction, undoing any per-directory shift a previous
+/// Set Time Correction run (`apply_time_corrections`) applied to it.
+pub fn clear_time_correction(conn: &Connection, key: &str) -> Result<(), DbError> {
+    conn.execute("UPDATE images SET corrected_date_taken = date_taken WHERE key = ?1", rusqlite::params![key])
+        .map_err(DbError::Sqlite)?;
+    Ok(())
+}
+
+/// Resets every photo's `corrected_date_taken` back to its original `date_taken` in one
+/// statement — backs the main window's Edit > Clear All Time Correction, effectively undoing
+/// every Set Time Correction alignment in the project at once.
+pub fn clear_all_time_corrections(conn: &Connection) -> Result<(), DbError> {
+    conn.execute("UPDATE images SET corrected_date_taken = date_taken", []).map_err(DbError::Sqlite)?;
+    Ok(())
+}
+
 /// Every image except a RAW image that's currently linked to a compressed sibling — the
 /// event-eligible image list Generate Events clusters, so a linked RAW never forms or joins
 /// its own event; only its compressed sibling participates. An unlinked RAW (no counterpart
@@ -255,6 +273,39 @@ pub fn list_images_by_keys(conn: &Connection, keys: &[String]) -> Result<Vec<Ima
         .map_err(DbError::Sqlite)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(keys), map_image_row).map_err(DbError::Sqlite)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Sqlite)
+}
+
+/// Adds `offset` to `corrected_date_taken` for every row under `toplevel_dir` (`None` = the
+/// project-root bucket), for each `(toplevel_dir, offset)` pair in `corrections`, in one
+/// transaction — backs the Set Time Correction dialog's Accept button. Applied against *every*
+/// row under the directory, not `list_event_eligible_images`'s filtered view, so a linked RAW
+/// picks up the same shift as the compressed sibling its lane displayed on its behalf. A row
+/// whose `corrected_date_taken` is still NULL is left untouched rather than erred: it has
+/// nothing to offset yet, and will be seeded already-corrected the next time Generate MetaData
+/// runs on it (mirrors `update_metadata`'s "not yet processed" stance). The new value is
+/// computed in Rust (`NaiveDateTime + Duration`) and written back directly, not via a SQL
+/// `datetime()` modifier, so no sub-second precision is lost. Uses `toplevel_dir IS ?1`, not
+/// `= ?1`, since `=` never matches NULL and the project-root bucket needs it to.
+pub fn apply_time_corrections(conn: &mut Connection, corrections: &[(Option<String>, Duration)]) -> Result<(), DbError> {
+    let tx = conn.transaction().map_err(DbError::Sqlite)?;
+    {
+        let mut select_stmt = tx
+            .prepare("SELECT key, corrected_date_taken FROM images WHERE toplevel_dir IS ?1 AND corrected_date_taken IS NOT NULL")
+            .map_err(DbError::Sqlite)?;
+        let mut update_stmt = tx.prepare("UPDATE images SET corrected_date_taken = ?2 WHERE key = ?1").map_err(DbError::Sqlite)?;
+
+        for (toplevel_dir, offset) in corrections {
+            let rows: Vec<(String, NaiveDateTime)> = select_stmt
+                .query_map(rusqlite::params![toplevel_dir], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(DbError::Sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DbError::Sqlite)?;
+            for (key, date_taken) in rows {
+                update_stmt.execute(rusqlite::params![key, date_taken + *offset]).map_err(DbError::Sqlite)?;
+            }
+        }
+    }
+    tx.commit().map_err(DbError::Sqlite)
 }
 
 #[cfg(test)]
@@ -420,5 +471,113 @@ mod tests {
         clear_color_correction(&conn, "a").unwrap();
 
         assert_eq!(crate::color_correction::from_record(&list_images(&conn).unwrap()[0]), None);
+    }
+
+    #[test]
+    fn clear_time_correction_resets_corrected_date_taken_to_date_taken() {
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("a", "a.jpg", "jpg")]).unwrap();
+        let date_taken = NaiveDateTime::parse_from_str("2024-01-01 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        conn.execute(
+            "UPDATE images SET date_taken = ?2, corrected_date_taken = ?3 WHERE key = ?1",
+            rusqlite::params![
+                "a",
+                date_taken,
+                NaiveDateTime::parse_from_str("2024-01-01 11:30:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+            ],
+        )
+        .unwrap();
+
+        clear_time_correction(&conn, "a").unwrap();
+
+        assert_eq!(list_images(&conn).unwrap()[0].corrected_date_taken, Some(date_taken));
+    }
+
+    #[test]
+    fn clear_all_time_corrections_resets_corrected_date_taken_for_every_image() {
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("a", "a.jpg", "jpg"), image("b", "b.jpg", "jpg")]).unwrap();
+        let date_a = NaiveDateTime::parse_from_str("2024-01-01 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let date_b = NaiveDateTime::parse_from_str("2024-02-02 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        conn.execute(
+            "UPDATE images SET date_taken = ?2, corrected_date_taken = ?3 WHERE key = ?1",
+            rusqlite::params!["a", date_a, NaiveDateTime::parse_from_str("2024-01-01 11:30:00", "%Y-%m-%d %H:%M:%S").unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE images SET date_taken = ?2, corrected_date_taken = ?3 WHERE key = ?1",
+            rusqlite::params!["b", date_b, NaiveDateTime::parse_from_str("2024-02-02 09:15:00", "%Y-%m-%d %H:%M:%S").unwrap()],
+        )
+        .unwrap();
+
+        clear_all_time_corrections(&conn).unwrap();
+
+        let images = list_images(&conn).unwrap();
+        assert_eq!(images.iter().find(|i| i.key == "a").unwrap().corrected_date_taken, Some(date_a));
+        assert_eq!(images.iter().find(|i| i.key == "b").unwrap().corrected_date_taken, Some(date_b));
+    }
+
+    fn image_with_dir(key: &str, path: &str, toplevel_dir: Option<&str>) -> ImageRecord {
+        ImageRecord {
+            key: key.to_string(),
+            path: path.to_string(),
+            image_type: "jpg".to_string(),
+            toplevel_dir: toplevel_dir.map(|s| s.to_string()),
+            ..ImageRecord::default()
+        }
+    }
+
+    fn set_corrected_date_taken(conn: &Connection, key: &str, value: &str) {
+        conn.execute(
+            "UPDATE images SET corrected_date_taken = ?2 WHERE key = ?1",
+            rusqlite::params![key, NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").unwrap()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn apply_time_corrections_shifts_only_the_targeted_directorys_dated_rows() {
+        let mut conn = migrated_conn();
+        super::super::directories::upsert_directories(&mut conn, &["50D".to_string(), "40D".to_string()]).unwrap();
+        upsert_images(
+            &mut conn,
+            &[
+                image_with_dir("a", "50D/a.jpg", Some("50D")),
+                image_with_dir("b", "50D/b.jpg", Some("50D")),
+                image_with_dir("c", "40D/c.jpg", Some("40D")),
+            ],
+        )
+        .unwrap();
+        set_corrected_date_taken(&conn, "a", "2026-01-01 10:00:00");
+        // "b" is left with no corrected_date_taken, as if Generate MetaData hasn't run on it yet.
+        set_corrected_date_taken(&conn, "c", "2026-01-01 10:00:00");
+
+        apply_time_corrections(&mut conn, &[(Some("50D".to_string()), Duration::minutes(30))]).unwrap();
+
+        let images = list_images(&conn).unwrap();
+        let a = images.iter().find(|i| i.key == "a").unwrap();
+        let b = images.iter().find(|i| i.key == "b").unwrap();
+        let c = images.iter().find(|i| i.key == "c").unwrap();
+        assert_eq!(a.corrected_date_taken.unwrap().to_string(), "2026-01-01 10:30:00");
+        assert_eq!(b.corrected_date_taken, None);
+        assert_eq!(c.corrected_date_taken.unwrap().to_string(), "2026-01-01 10:00:00");
+    }
+
+    #[test]
+    fn apply_time_corrections_matches_the_project_root_bucket_via_is_null() {
+        let mut conn = migrated_conn();
+        super::super::directories::upsert_directories(&mut conn, &["50D".to_string()]).unwrap();
+        upsert_images(&mut conn, &[image_with_dir("root", "root.jpg", None), image_with_dir("dir", "50D/a.jpg", Some("50D"))])
+            .unwrap();
+        set_corrected_date_taken(&conn, "root", "2026-01-01 10:00:00");
+        set_corrected_date_taken(&conn, "dir", "2026-01-01 10:00:00");
+
+        apply_time_corrections(&mut conn, &[(None, Duration::hours(1))]).unwrap();
+
+        let images = list_images(&conn).unwrap();
+        let root = images.iter().find(|i| i.key == "root").unwrap();
+        let dir = images.iter().find(|i| i.key == "dir").unwrap();
+        assert_eq!(root.corrected_date_taken.unwrap().to_string(), "2026-01-01 11:00:00");
+        assert_eq!(dir.corrected_date_taken.unwrap().to_string(), "2026-01-01 10:00:00");
     }
 }

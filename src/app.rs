@@ -29,6 +29,7 @@ use crate::scan;
 use crate::settings::{self, AppConfig};
 use crate::settings_modal;
 use crate::shortcuts::{self, ShortcutAction};
+use crate::time_correction_modal;
 use crate::window_mode;
 
 const PROJECT_FILTER: &str = "PhotoMatic Project(*.json)";
@@ -98,7 +99,11 @@ const METADATA_BUTTON_WIDTH: f32 = SCAN_BUTTON_WIDTH;
 /// its own (it runs synchronously — see `start_generate_events`), so it bottom-aligns with
 /// the other two columns via `scan_area_layout`'s `align_items: FlexEnd`.
 const EVENTS_BUTTON_WIDTH: f32 = SCAN_BUTTON_WIDTH;
-/// Horizontal gap between the Scan Directory, Generate MetaData, and Generate Events columns.
+/// Width of the Set Time Correction button, next to Generate Events. No progress bar of its
+/// own either — opening the dialog is a fast DB read, not a background scan.
+const TIME_CORRECTION_BUTTON_WIDTH: f32 = SCAN_BUTTON_WIDTH;
+/// Horizontal gap between the Scan Directory, Generate MetaData, Generate Events, and Set Time
+/// Correction columns.
 const SCAN_AREA_COLUMN_GAP: f32 = 12.0;
 
 /// Sizes for an event tab's Title row (label, input, and the View Images/Prev/Next buttons
@@ -308,6 +313,7 @@ pub struct App {
     /// `export_selected_collection`, consumed by `export_options_closed`.
     export_options_collection_id: RefCell<Option<i64>>,
     export_progress_thread: RefCell<Option<thread::JoinHandle<export::ExportOutcome>>>,
+    time_correction_thread: RefCell<Option<thread::JoinHandle<Option<Vec<(Option<String>, chrono::Duration)>>>>>,
 
     #[nwg_control(title: "PhotoMatic", flags: "MAIN_WINDOW")]
     #[nwg_events(OnWindowClose: [App::exit], OnKeyPress: [App::on_key_press(SELF, EVT_DATA)])]
@@ -336,6 +342,10 @@ pub struct App {
     #[nwg_control]
     #[nwg_events(OnNotice: [App::generate_metadata_finished])]
     metadata_notice: nwg::Notice,
+
+    #[nwg_control]
+    #[nwg_events(OnNotice: [App::time_correction_dialog_closed])]
+    time_correction_notice: nwg::Notice,
 
     #[nwg_control]
     #[nwg_events(OnNotice: [App::db_open_finished])]
@@ -377,6 +387,18 @@ pub struct App {
     #[nwg_control(parent: edit_menu, text: "&Add Collection...")]
     #[nwg_events(OnMenuItemSelected: [App::open_add_collection])]
     edit_add_collection: nwg::MenuItem,
+
+    #[nwg_control(parent: edit_menu)]
+    edit_menu_sep: nwg::MenuSeparator,
+
+    /// Resets `corrected_date_taken` back to `date_taken` for every image in the project at
+    /// once — the whole-project counterpart to the Image Viewer's per-photo Edit > Clear Time
+    /// Correction. Set apart from Settings/Add Collection by `edit_menu_sep` since, unlike
+    /// them, it's destructive project-wide. No accelerator per `CLAUDE.md`: no Windows-standard
+    /// key combination exists for this action, so mnemonic only.
+    #[nwg_control(parent: edit_menu, text: "Clear &All Time Correction")]
+    #[nwg_events(OnMenuItemSelected: [App::clear_all_time_correction])]
+    edit_clear_all_time_correction: nwg::MenuItem,
 
     #[nwg_control(parent: window, text: "&Help")]
     help_menu: nwg::Menu,
@@ -490,6 +512,10 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::start_generate_events])]
     events_button: nwg::Button,
 
+    #[nwg_control(parent: scan_area_frame, text: "Set &Time Correction")]
+    #[nwg_events(OnButtonClick: [App::open_time_correction])]
+    time_correction_button: nwg::Button,
+
     #[nwg_control(parent: nav_frame, flags: "VISIBLE")]
     #[nwg_events(
         OnTreeViewRightClick: [App::nav_tree_right_click],
@@ -568,6 +594,7 @@ pub struct App {
     scan_column_layout: nwg::FlexboxLayout,
     metadata_column_layout: nwg::FlexboxLayout,
     events_column_layout: nwg::FlexboxLayout,
+    time_correction_column_layout: nwg::FlexboxLayout,
     nav_layout: nwg::FlexboxLayout,
     context_layout: nwg::FlexboxLayout,
 }
@@ -761,10 +788,23 @@ impl App {
             .build_partial(&self.events_column_layout)
             .expect("Failed to build the Generate Events column layout");
 
+        // Same "no progress bar, explicit no-op margin" reasoning as `events_column_layout`.
+        nwg::FlexboxLayout::builder()
+            .parent(&self.scan_area_frame)
+            .flex_direction(FlexDirection::Column)
+            .justify_content(JustifyContent::FlexEnd)
+            .align_items(AlignItems::FlexEnd)
+            .child(&self.time_correction_button)
+            .child_size(Size { width: D::Points(TIME_CORRECTION_BUTTON_WIDTH), height: D::Points(SCAN_BUTTON_HEIGHT) })
+            .child_margin(no_spacing)
+            .build_partial(&self.time_correction_column_layout)
+            .expect("Failed to build the Set Time Correction column layout");
+
         // Terminal layout for `scan_area_frame` — one `child_layout` level nesting
-        // `scan_column_layout`/`metadata_column_layout`/`events_column_layout`, same depth
-        // as the proven `nav_layout` pattern, so it reliably fills and right/bottom-aligns
-        // within whatever size `scan_area_frame` is given below.
+        // `scan_column_layout`/`metadata_column_layout`/`events_column_layout`/
+        // `time_correction_column_layout`, same depth as the proven `nav_layout` pattern, so
+        // it reliably fills and right/bottom-aligns within whatever size `scan_area_frame` is
+        // given below.
         let scan_area_column_margin =
             Rect { start: D::Points(0.0), end: D::Points(SCAN_AREA_COLUMN_GAP), top: D::Points(0.0), bottom: D::Points(0.0) };
         nwg::FlexboxLayout::builder()
@@ -780,6 +820,9 @@ impl App {
             .child_margin(scan_area_column_margin)
             .child_layout(&self.events_column_layout)
             .child_size(Size { width: D::Points(EVENTS_BUTTON_WIDTH), height: D::Auto })
+            .child_margin(scan_area_column_margin)
+            .child_layout(&self.time_correction_column_layout)
+            .child_size(Size { width: D::Points(TIME_CORRECTION_BUTTON_WIDTH), height: D::Auto })
             .build(&self.scan_area_layout)
             .expect("Failed to build the Scan Directory area layout");
 
@@ -1214,6 +1257,47 @@ impl App {
         *self.collection_modal_editing_id.borrow_mut() = None;
         let handle = collection_modal::open(None, other_shortcuts, self.collection_notice.sender());
         *self.collection_modal_thread.borrow_mut() = Some(handle);
+    }
+
+    /// Edit > Clear All Time Correction: resets every image's `corrected_date_taken` back to
+    /// its original `date_taken`, undoing every Set Time Correction alignment made anywhere in
+    /// the project — effectively forcing a fresh start. Confirms first (`nwg::modal_message`,
+    /// mirroring `delete_selected_collection`), since this touches every row at once and can't
+    /// be undone short of re-running Set Time Correction for every directory again. Re-runs
+    /// Generate Events afterward (`regenerate_events_now`), same as
+    /// `time_correction_dialog_closed`, since `corrected_date_taken` just changed for every photo.
+    fn clear_all_time_correction(&self) {
+        let has_db = self.db.borrow().is_some();
+        if !has_db {
+            nwg::simple_message("PhotoMatic", "Please open or save a project before clearing time corrections.");
+            return;
+        }
+
+        let choice = nwg::modal_message(
+            &self.window,
+            &nwg::MessageParams {
+                title: "PhotoMatic",
+                content: "Reset every photo's corrected date taken back to its original value? \
+                          This undoes every Set Time Correction alignment in this project and \
+                          cannot be undone.",
+                buttons: nwg::MessageButtons::YesNo,
+                icons: nwg::MessageIcons::Warning,
+            },
+        );
+        if choice != nwg::MessageChoice::Yes {
+            return;
+        }
+
+        {
+            let mut db = self.db.borrow_mut();
+            let Some(db) = db.as_mut() else { return };
+            if let Err(err) = db.clear_all_time_corrections() {
+                nwg::simple_message("PhotoMatic", &format!("Failed to clear time corrections: {err}"));
+                return;
+            }
+        }
+
+        self.regenerate_events_now();
     }
 
     /// The collection context menu's Edit item's dialog opener: prefills the dialog with
@@ -2276,7 +2360,17 @@ impl App {
     /// background thread.
     fn start_generate_events(&self) {
         self.sync_event_thresholds_from_inputs();
+        self.regenerate_events_now();
+    }
 
+    /// The actual regenerate-events work `start_generate_events` does, factored out so
+    /// `time_correction_dialog_closed` can also call it — a time correction changes
+    /// `corrected_date_taken`, which is exactly what event clustering is keyed on, so applying
+    /// one needs events re-clustered too. Asks for confirmation first (and returns without
+    /// changing anything) if regenerating would erase already-entered titles/notes; refreshes
+    /// `nav_tree`'s Events node on completion either way (matching `start_generate_events`'s
+    /// original behavior of refreshing even after a failed `regenerate_events` call).
+    fn regenerate_events_now(&self) {
         {
             let mut db = self.db.borrow_mut();
             let Some(db) = db.as_mut() else { return };
@@ -2318,6 +2412,54 @@ impl App {
         // `nav_tree`'s Events node (and `event_order`/`event_tree_items`) needs rebuilding
         // to reflect them — nothing else does this automatically after Generate Events.
         self.refresh_nav_tree();
+    }
+
+    /// Opens the Set Time Correction dialog with every event-eligible image (the same list
+    /// Generate Events uses — already RAW/compressed-linking aware), so its lanes group exactly
+    /// the directories Generate Events would cluster. Disallows a second concurrent dialog,
+    /// same guard as `open_add_collection`. Deliberately doesn't pre-check "at least two
+    /// directories with dated photos" here — `time_correction::compute_offsets` is the single
+    /// source of truth for that, surfaced via the dialog's own error message without closing it.
+    fn open_time_correction(&self) {
+        if self.time_correction_thread.borrow().is_some() {
+            return;
+        }
+        let Some(source_dir) = self.project.borrow().source_directory.clone() else {
+            nwg::simple_message("PhotoMatic", "Please choose and scan a Source Directory first.");
+            return;
+        };
+        let images = {
+            let db = self.db.borrow();
+            let Some(db) = db.as_ref() else {
+                nwg::simple_message("PhotoMatic", "Please scan and generate metadata before setting a time correction.");
+                return;
+            };
+            db.list_images_for_event_generation().unwrap_or_default()
+        };
+
+        let handle = time_correction_modal::open(images, source_dir, self.time_correction_notice.sender());
+        *self.time_correction_thread.borrow_mut() = Some(handle);
+    }
+
+    /// Fired via `OnNotice` once the Set Time Correction dialog thread finishes. `None`
+    /// (Cancel, or the dialog's own close button) does nothing. `Some(corrections)` writes the
+    /// offsets (`ProjectDb::apply_time_corrections`) and then re-runs Generate Events
+    /// (`regenerate_events_now`) so the app is left consistent with the new alignment — events
+    /// were clustered on the pre-correction `corrected_date_taken` values, which just changed.
+    fn time_correction_dialog_closed(&self) {
+        let Some(handle) = self.time_correction_thread.borrow_mut().take() else { return };
+        let Ok(Some(corrections)) = handle.join() else { return };
+
+        {
+            let mut db = self.db.borrow_mut();
+            let Some(db) = db.as_mut() else { return };
+            if let Err(err) = db.apply_time_corrections(&corrections) {
+                nwg::simple_message("PhotoMatic", &format!("Failed to apply the time correction: {err}"));
+                return;
+            }
+        }
+
+        self.regenerate_events_now();
     }
 
     /// Extracts EXIF metadata for every image that doesn't have it yet, on a small

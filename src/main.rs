@@ -26,6 +26,8 @@ mod scan;
 mod settings;
 mod settings_modal;
 mod shortcuts;
+mod time_correction;
+mod time_correction_modal;
 mod window_mode;
 
 use native_windows_gui as nwg;
