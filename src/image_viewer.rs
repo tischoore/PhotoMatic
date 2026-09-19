@@ -38,8 +38,16 @@ const DELETE_BUTTON_WIDTH: f32 = 70.0;
 const ROTATE_BUTTON_WIDTH: f32 = 70.0;
 /// Width of the Auto Correct button, wider than Rotate since its label is longer.
 const AUTO_CORRECT_BUTTON_WIDTH: f32 = 100.0;
-/// Width of one collection toggle button — just its shortcut letter, so this stays narrow.
-const COLLECTION_BUTTON_WIDTH: f32 = 40.0;
+/// Estimated width, in points, of one character at this window's default UI font — used to size
+/// each collection button from its own label length, since (unlike every other button in this
+/// window) collection names are arbitrary user text rather than a fixed compile-time string.
+const COLLECTION_BUTTON_CHAR_WIDTH: f32 = 7.0;
+/// Fixed padding added to every collection button (checkbox box, mnemonic parenthesis, margins),
+/// on top of its per-character width.
+const COLLECTION_BUTTON_PADDING: f32 = 30.0;
+/// Floor under `collection_button_width`, so a very short name/shortcut still gets a comfortably
+/// clickable button.
+const COLLECTION_BUTTON_MIN_WIDTH: f32 = 60.0;
 /// Width of the "Image Nr:" label, next to Prev/Next.
 const IMAGE_NR_LABEL_WIDTH: f32 = 60.0;
 /// Width of the Image Nr input box — just enough digits for a large project's photo count.
@@ -424,32 +432,36 @@ impl ImageViewer {
         app.window.set_visible(true);
     }
 
-    /// Builds one `nwg::CheckBox` per collection, labeled with its shortcut — a `CheckBox`'s
-    /// real checked/unchecked visual is reused as the "pressed" look for collection
-    /// membership, the same idiom `app.rs` already uses for the File Types checkboxes, rather
-    /// than inventing a new control style. The label's `&` mnemonic is the collection's own
-    /// shortcut letter, so Alt+<shortcut> toggles it too — since these buttons are built at
-    /// runtime (unknown at compile time) rather than declared with a `\t`-suffixed accelerator
-    /// label, this is the natural per-`CLAUDE.md` way to give each one a keyboard shortcut
-    /// without inventing an unrelated binding; collisions can't happen since shortcuts are
-    /// enforced unique when a collection is created/edited.
+    /// Builds one `nwg::CheckBox` per collection, labeled with its name and shortcut (e.g.
+    /// "Landscape (L)") — a `CheckBox`'s real checked/unchecked visual is reused as the
+    /// "pressed" look for collection membership, the same idiom `app.rs` already uses for the
+    /// File Types checkboxes, rather than inventing a new control style. The label's `&`
+    /// mnemonic is on the collection's own shortcut letter, so Alt+<shortcut> toggles it too —
+    /// since these buttons are built at runtime (unknown at compile time) rather than declared
+    /// with a `\t`-suffixed accelerator label, this is the natural per-`CLAUDE.md` way to give
+    /// each one a keyboard shortcut without inventing an unrelated binding; collisions can't
+    /// happen since shortcuts are enforced unique when a collection is created/edited.
     fn build_collection_buttons(&self) {
         let mut buttons = Vec::new();
+        let mut labels = Vec::new();
         for collection in self.collections.borrow().iter() {
+            let label = collection_button_label(&collection.name, &collection.shortcut);
             let mut checkbox = nwg::CheckBox::default();
             nwg::CheckBox::builder()
                 .parent(&self.window)
-                .text(&format!("&{}", collection.shortcut))
+                .text(&label)
                 .build(&mut checkbox)
                 .expect("Failed to build a collection toggle button");
             buttons.push((checkbox, collection.id));
+            labels.push(label);
         }
 
         let mut builder = nwg::FlexboxLayout::builder().parent(&self.window).flex_direction(FlexDirection::Row);
-        for (checkbox, _) in &buttons {
-            builder = builder
-                .child(checkbox)
-                .child_size(Size { width: D::Points(COLLECTION_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) });
+        for ((checkbox, _), label) in buttons.iter().zip(&labels) {
+            builder = builder.child(checkbox).child_size(Size {
+                width: D::Points(collection_button_width(label)),
+                height: D::Points(TOP_ROW_HEIGHT),
+            });
         }
         builder.build_partial(&self.collection_row_layout).expect("Failed to build the Image Viewer's collection row layout");
 
@@ -1565,6 +1577,23 @@ fn format_metadata(record: &ImageRecord) -> String {
     )
 }
 
+/// Formats a collection toggle button's label: the collection's name, then its shortcut letter
+/// in parentheses with the `&` mnemonic on the letter itself (e.g. "Landscape (&L)"), so Alt+L
+/// still toggles it exactly as before, now with the name visible instead of just the letter.
+fn collection_button_label(name: &str, shortcut: &str) -> String {
+    format!("{} (&{})", name, shortcut)
+}
+
+/// Width, in points, a collection toggle button needs for `label` — grown from a per-character
+/// estimate rather than a single fixed constant, since (unlike every other button in this
+/// window) collection labels are arbitrary user-typed names rather than a fixed compile-time
+/// string, and floored at `COLLECTION_BUTTON_MIN_WIDTH` so a very short label still gets a
+/// comfortably clickable button.
+fn collection_button_width(label: &str) -> f32 {
+    (label.chars().count() as f32 * COLLECTION_BUTTON_CHAR_WIDTH + COLLECTION_BUTTON_PADDING)
+        .max(COLLECTION_BUTTON_MIN_WIDTH)
+}
+
 /// The `ImageRecord` `show_current_image`/`show_metadata` should render for `index`: the
 /// linked counterpart from `linked_images` when `showing_counterpart` is set and one exists
 /// for the photo at `index`, otherwise the photo at `index` itself. `None` only when `index`
@@ -1648,6 +1677,24 @@ mod tests {
 
     fn image(key: &str, path: &str) -> ImageRecord {
         ImageRecord { key: key.to_string(), path: path.to_string(), image_type: "jpg".to_string(), ..ImageRecord::default() }
+    }
+
+    #[test]
+    fn collection_button_label_wraps_shortcut_in_parens_with_mnemonic() {
+        assert_eq!(collection_button_label("Landscape", "l"), "Landscape (&l)");
+    }
+
+    #[test]
+    fn collection_button_width_floors_short_labels_at_the_minimum() {
+        assert_eq!(collection_button_width(""), COLLECTION_BUTTON_MIN_WIDTH);
+    }
+
+    #[test]
+    fn collection_button_width_grows_with_longer_labels() {
+        let short = collection_button_width(&collection_button_label("A", "a"));
+        let long = collection_button_width(&collection_button_label("A Very Long Collection Name", "a"));
+
+        assert!(long > short);
     }
 
     #[test]
