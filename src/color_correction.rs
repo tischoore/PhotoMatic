@@ -5,15 +5,22 @@ use crate::db::models::ImageRecord;
 /// Mirrors `ImageRecord::rotation`'s pattern of "a small numeric summary of a non-destructive
 /// transform, applied at render/export time" — computed once by the Auto Correct button, stored
 /// in the database, and replayed at both view time and recompressed-export time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorCorrectionParams {
     pub black: [u8; 3],
     pub white: [u8; 3],
+    /// How strongly the stretch below is applied, from `0.0` (original pixels) to `1.0` (the
+    /// full stretch) — see `build_blended_lut`. Not `Eq`-comparable (it's an `f64`), which is
+    /// why this struct only derives `PartialEq`.
+    pub blend: f64,
 }
 
 /// Fraction of a channel's pixels clipped from EACH tail before stretching the rest to the full
 /// range — Limare et al.'s default operating point (1% low + 1% high = 2% total).
 pub const DEFAULT_CLIP_FRACTION: f64 = 0.01;
+
+/// The blend a freshly computed correction starts at — see `ColorCorrectionParams::blend`.
+pub const DEFAULT_BLEND: f64 = 0.5;
 
 /// A 256-bucket histogram of one channel's values across every pixel in an interleaved buffer
 /// (e.g. RGB or RGBA). `channels` is the buffer's bytes-per-pixel (3 or 4); `channel_index`
@@ -78,7 +85,7 @@ pub fn compute_scb_params(pixels: &[u8], channels: usize, clip_fraction: f64) ->
         *b = channel_black;
         *w = channel_white;
     }
-    ColorCorrectionParams { black, white }
+    ColorCorrectionParams { black, white, blend: DEFAULT_BLEND }
 }
 
 /// The 256-entry input->output lookup table for one channel's stretch: `v <= black` maps to 0,
@@ -101,14 +108,43 @@ pub fn build_lut(black: u8, white: u8) -> [u8; 256] {
     lut
 }
 
-/// Rebuilds `ColorCorrectionParams` from `ImageRecord`'s six flat nullable columns — `None` if
-/// any of the six is `None` (matches `rotation`'s "never run yet" semantics; the six are always
-/// written together by `image_viewer::toggle_auto_correct`, so a partial `None` shouldn't
+/// `build_lut`'s stretch blended toward identity by `blend` (clamped to 0.0-1.0): `0.0` leaves
+/// pixels untouched, `1.0` is identical to `build_lut`'s own full stretch. Built once per
+/// channel per render, same as `build_lut`, and applied the same way — via a 256-entry table
+/// rather than recomputed per pixel.
+pub fn build_blended_lut(black: u8, white: u8, blend: f64) -> [u8; 256] {
+    let stretch = build_lut(black, white);
+    let blend = blend.clamp(0.0, 1.0);
+    let mut lut = [0u8; 256];
+    for (value, entry) in lut.iter_mut().enumerate() {
+        let stretched = stretch[value] as f64;
+        *entry = (value as f64 + blend * (stretched - value as f64)).round() as u8;
+    }
+    lut
+}
+
+/// The Blend slider's trackbar position (0-100) for a blend fraction, rounded to the nearest
+/// whole percent.
+pub fn slider_pos_from_blend(blend: f64) -> usize {
+    (blend.clamp(0.0, 1.0) * 100.0).round() as usize
+}
+
+/// The blend fraction (0.0-1.0) for a Blend slider trackbar position — positions above 100
+/// clamp down, since the trackbar's own range should never produce one but this stays
+/// defensive either way.
+pub fn blend_from_slider_pos(pos: usize) -> f64 {
+    pos.min(100) as f64 / 100.0
+}
+
+/// Rebuilds `ColorCorrectionParams` from `ImageRecord`'s seven flat nullable columns — `None` if
+/// any of the seven is `None` (matches `rotation`'s "never run yet" semantics; the seven are
+/// always written together by `image_viewer::toggle_auto_correct`, so a partial `None` shouldn't
 /// occur in practice, but this stays defensive either way).
 pub fn from_record(record: &ImageRecord) -> Option<ColorCorrectionParams> {
     Some(ColorCorrectionParams {
         black: [record.color_black_r?, record.color_black_g?, record.color_black_b?],
         white: [record.color_white_r?, record.color_white_g?, record.color_white_b?],
+        blend: record.color_blend?,
     })
 }
 
@@ -176,6 +212,12 @@ mod tests {
     }
 
     #[test]
+    fn compute_scb_params_starts_at_the_default_blend() {
+        let params = compute_scb_params(&[100u8, 150, 200], 3, 0.01);
+        assert_eq!(params.blend, DEFAULT_BLEND);
+    }
+
+    #[test]
     fn build_lut_clips_below_black_and_above_white_and_interpolates_between() {
         let lut = build_lut(50, 200);
         assert_eq!(lut[0], 0);
@@ -194,6 +236,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn build_blended_lut_is_a_no_op_identity_at_zero_blend() {
+        let lut = build_blended_lut(50, 200, 0.0);
+        for value in 0..=255u8 {
+            assert_eq!(lut[value as usize], value);
+        }
+    }
+
+    #[test]
+    fn build_blended_lut_equals_build_lut_at_full_blend() {
+        assert_eq!(build_blended_lut(50, 200, 1.0), build_lut(50, 200));
+    }
+
+    #[test]
+    fn build_blended_lut_is_halfway_between_identity_and_full_stretch_at_half_blend() {
+        let stretch = build_lut(50, 200);
+        let blended = build_blended_lut(50, 200, 0.5);
+        for value in 0..=255usize {
+            let expected = (value as f64 + 0.5 * (stretch[value] as f64 - value as f64)).round() as u8;
+            assert_eq!(blended[value], expected);
+        }
+        // Sanity check on a concrete value: identity at 125 blended halfway toward the full
+        // stretch's ~127 lands close to the midpoint, not at either endpoint.
+        assert!(blended[125] > 60 && blended[125] < 190);
+    }
+
+    #[test]
+    fn build_blended_lut_clamps_blend_outside_zero_to_one() {
+        assert_eq!(build_blended_lut(50, 200, -1.0), build_blended_lut(50, 200, 0.0));
+        assert_eq!(build_blended_lut(50, 200, 2.0), build_blended_lut(50, 200, 1.0));
+    }
+
+    #[test]
+    fn slider_pos_from_blend_round_trips_common_values() {
+        assert_eq!(slider_pos_from_blend(0.0), 0);
+        assert_eq!(slider_pos_from_blend(0.5), 50);
+        assert_eq!(slider_pos_from_blend(1.0), 100);
+    }
+
+    #[test]
+    fn slider_pos_from_blend_clamps_outside_zero_to_one() {
+        assert_eq!(slider_pos_from_blend(-1.0), 0);
+        assert_eq!(slider_pos_from_blend(2.0), 100);
+    }
+
+    #[test]
+    fn blend_from_slider_pos_round_trips_common_values() {
+        assert_eq!(blend_from_slider_pos(0), 0.0);
+        assert_eq!(blend_from_slider_pos(50), 0.5);
+        assert_eq!(blend_from_slider_pos(100), 1.0);
+    }
+
+    #[test]
+    fn blend_from_slider_pos_clamps_positions_above_100() {
+        assert_eq!(blend_from_slider_pos(150), 1.0);
+    }
+
     fn record_with_correction() -> ImageRecord {
         ImageRecord {
             color_black_r: Some(1),
@@ -202,12 +301,13 @@ mod tests {
             color_white_r: Some(250),
             color_white_g: Some(251),
             color_white_b: Some(252),
+            color_blend: Some(1.0),
             ..ImageRecord::default()
         }
     }
 
     #[test]
-    fn from_record_is_none_when_any_of_the_six_fields_is_null() {
+    fn from_record_is_none_when_any_of_the_seven_fields_is_null() {
         let mut record = record_with_correction();
         record.color_white_b = None;
         assert_eq!(from_record(&record), None);
@@ -215,9 +315,17 @@ mod tests {
     }
 
     #[test]
-    fn from_record_reassembles_all_six_fields_when_present() {
+    fn from_record_is_none_when_color_blend_is_null_even_if_the_other_six_are_set() {
+        let mut record = record_with_correction();
+        record.color_blend = None;
+        assert_eq!(from_record(&record), None);
+    }
+
+    #[test]
+    fn from_record_reassembles_all_seven_fields_when_present() {
         let params = from_record(&record_with_correction()).unwrap();
         assert_eq!(params.black, [1, 2, 3]);
         assert_eq!(params.white, [250, 251, 252]);
+        assert_eq!(params.blend, 1.0);
     }
 }

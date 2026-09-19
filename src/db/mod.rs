@@ -342,10 +342,16 @@ impl ProjectDb {
         images::set_color_correction(&self.conn, key, params)
     }
 
-    /// Deletes one image's Simplest Color Balance correction — the Image Viewer's Auto Correct
-    /// checkbox being unchecked.
+    /// Deletes one image's Simplest Color Balance correction (including its blend fraction) —
+    /// the Image Viewer's Auto Correct checkbox being unchecked.
     pub fn clear_image_color_correction(&self, key: &str) -> Result<(), DbError> {
         images::clear_color_correction(&self.conn, key)
+    }
+
+    /// Writes one image's Auto Correct blend fraction — the Image Viewer's Blend slider. A
+    /// lighter-weight write than `set_image_color_correction`: the clip points aren't changing.
+    pub fn set_image_color_blend(&self, key: &str, blend: f64) -> Result<(), DbError> {
+        images::set_color_blend(&self.conn, key, blend)
     }
 
     /// Resets one image's `corrected_date_taken` back to its original `date_taken` — the Image
@@ -440,7 +446,7 @@ mod tests {
         let db = ProjectDb::open(&path).unwrap();
 
         assert!(path.exists());
-        assert_eq!(db.schema_version().unwrap(), 14);
+        assert_eq!(db.schema_version().unwrap(), 15);
 
         std::fs::remove_file(&path).ok();
     }

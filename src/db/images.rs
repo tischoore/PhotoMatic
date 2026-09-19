@@ -38,7 +38,8 @@ pub fn upsert_images(conn: &mut Connection, images: &[ImageRecord]) -> Result<()
 /// `ImageRecord` query, without duplicating it.
 pub(super) const IMAGE_COLUMNS: &str = "key, path, image_type, toplevel_dir, date_taken, corrected_date_taken, \
      width, height, exposure_time, iso, focal_length, gps_latitude, gps_longitude, gps_altitude, metadata_read_at, \
-     linked_key, rotation, color_black_r, color_black_g, color_black_b, color_white_r, color_white_g, color_white_b";
+     linked_key, rotation, color_black_r, color_black_g, color_black_b, color_white_r, color_white_g, color_white_b, \
+     color_blend";
 
 pub(super) fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord> {
     Ok(ImageRecord {
@@ -65,6 +66,7 @@ pub(super) fn map_image_row(row: &rusqlite::Row) -> rusqlite::Result<ImageRecord
         color_white_r: row.get(20)?,
         color_white_g: row.get(21)?,
         color_white_b: row.get(22)?,
+        color_blend: row.get(23)?,
     })
 }
 
@@ -221,10 +223,20 @@ pub fn set_color_correction(
 pub fn clear_color_correction(conn: &Connection, key: &str) -> Result<(), DbError> {
     conn.execute(
         "UPDATE images SET color_black_r = NULL, color_black_g = NULL, color_black_b = NULL, \
-         color_white_r = NULL, color_white_g = NULL, color_white_b = NULL WHERE key = ?1",
+         color_white_r = NULL, color_white_g = NULL, color_white_b = NULL, color_blend = NULL WHERE key = ?1",
         rusqlite::params![key],
     )
     .map_err(DbError::Sqlite)?;
+    Ok(())
+}
+
+/// Writes the current photo's Auto Correct blend fraction (0.0 = original pixels, 1.0 = the
+/// full correction) — backs the Image Viewer's Blend slider. A single-column update, unlike
+/// `set_color_correction`: the clip points themselves aren't changing, so there's no need to
+/// recompute them.
+pub fn set_color_blend(conn: &Connection, key: &str, blend: f64) -> Result<(), DbError> {
+    conn.execute("UPDATE images SET color_blend = ?2 WHERE key = ?1", rusqlite::params![key, blend])
+        .map_err(DbError::Sqlite)?;
     Ok(())
 }
 
@@ -452,10 +464,27 @@ mod tests {
         upsert_images(&mut conn, &[image("a", "a.jpg", "jpg")]).unwrap();
         assert_eq!(crate::color_correction::from_record(&list_images(&conn).unwrap()[0]), None);
 
-        let params = ColorCorrectionParams { black: [1, 2, 3], white: [250, 251, 252] };
+        let params = ColorCorrectionParams { black: [1, 2, 3], white: [250, 251, 252], blend: 0.75 };
         set_color_correction(&conn, "a", &params).unwrap();
+        set_color_blend(&conn, "a", params.blend).unwrap();
 
         assert_eq!(crate::color_correction::from_record(&list_images(&conn).unwrap()[0]), Some(params));
+    }
+
+    #[test]
+    fn set_color_blend_round_trips_through_list_images() {
+        use crate::color_correction::ColorCorrectionParams;
+
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("a", "a.jpg", "jpg")]).unwrap();
+        let params = ColorCorrectionParams { black: [1, 2, 3], white: [250, 251, 252], blend: 0.5 };
+        set_color_correction(&conn, "a", &params).unwrap();
+        set_color_blend(&conn, "a", 0.5).unwrap();
+        assert_eq!(list_images(&conn).unwrap()[0].color_blend, Some(0.5));
+
+        set_color_blend(&conn, "a", 0.25).unwrap();
+
+        assert_eq!(list_images(&conn).unwrap()[0].color_blend, Some(0.25));
     }
 
     #[test]
@@ -464,13 +493,29 @@ mod tests {
 
         let mut conn = migrated_conn();
         upsert_images(&mut conn, &[image("a", "a.jpg", "jpg")]).unwrap();
-        let params = ColorCorrectionParams { black: [1, 2, 3], white: [250, 251, 252] };
+        let params = ColorCorrectionParams { black: [1, 2, 3], white: [250, 251, 252], blend: 0.5 };
         set_color_correction(&conn, "a", &params).unwrap();
+        set_color_blend(&conn, "a", params.blend).unwrap();
         assert_eq!(crate::color_correction::from_record(&list_images(&conn).unwrap()[0]), Some(params));
 
         clear_color_correction(&conn, "a").unwrap();
 
         assert_eq!(crate::color_correction::from_record(&list_images(&conn).unwrap()[0]), None);
+    }
+
+    #[test]
+    fn clear_color_correction_also_nulls_color_blend() {
+        use crate::color_correction::ColorCorrectionParams;
+
+        let mut conn = migrated_conn();
+        upsert_images(&mut conn, &[image("a", "a.jpg", "jpg")]).unwrap();
+        let params = ColorCorrectionParams { black: [1, 2, 3], white: [250, 251, 252], blend: 0.5 };
+        set_color_correction(&conn, "a", &params).unwrap();
+        set_color_blend(&conn, "a", params.blend).unwrap();
+
+        clear_color_correction(&conn, "a").unwrap();
+
+        assert_eq!(list_images(&conn).unwrap()[0].color_blend, None);
     }
 
     #[test]

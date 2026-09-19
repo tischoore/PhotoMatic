@@ -44,6 +44,12 @@ const COLLECTION_BUTTON_WIDTH: f32 = 40.0;
 const IMAGE_NR_LABEL_WIDTH: f32 = 60.0;
 /// Width of the Image Nr input box — just enough digits for a large project's photo count.
 const IMAGE_NR_INPUT_WIDTH: f32 = 50.0;
+/// Width of the "Blend:" label, next to Auto Correct.
+const BLEND_LABEL_WIDTH: f32 = 42.0;
+/// Width of the Blend trackbar itself.
+const BLEND_TRACKBAR_WIDTH: f32 = 120.0;
+/// Width of the blend percentage readout (e.g. "100%"), next to the trackbar.
+const BLEND_VALUE_LABEL_WIDTH: f32 = 36.0;
 
 /// Opens the Image Viewer on its own thread for one event's or collection's photos, starting
 /// at `start_index`. The window's title is a snapshot of `title` at open time — unlike an
@@ -328,6 +334,30 @@ pub struct ImageViewer {
     #[nwg_events(OnButtonClick: [ImageViewer::toggle_auto_correct])]
     auto_correct_button: nwg::CheckBox,
 
+    /// Plain descriptive text, no mnemonic — matches `image_nr_label`'s precedent: Win32
+    /// mnemonics only apply to buttons/menu items/checkboxes, not text fields or trackbars, and
+    /// no Windows-standard accelerator exists for a blend slider either, so per `CLAUDE.md`
+    /// there's no accelerator to give this pairing beyond the trackbar's own Tab-order
+    /// reachability.
+    #[nwg_control(parent: window, text: "Blend:")]
+    blend_label: nwg::Label,
+
+    /// Scales the current photo's Auto Correct strength from 0% (original pixels) to 100% (the
+    /// full computed correction). Enabled and set to the photo's stored blend only while it has
+    /// an active correction (`color_correction::from_record` is `Some`); disabled and reset to
+    /// the 50% position — the default a *new* correction would start at — otherwise. Moving it
+    /// is cheap and synchronous (`on_blend_changed`): unlike computing the correction itself, no
+    /// decode/histogram pass is needed, just a re-blend of the already-known clip points. See
+    /// `refresh_blend_slider`.
+    #[nwg_control(parent: window, flags: "VISIBLE|HORIZONTAL|TAB_STOP", range: Some(0..100), pos: Some(50))]
+    #[nwg_events(OnHorizontalScroll: [ImageViewer::on_blend_changed])]
+    blend_trackbar: nwg::TrackBar,
+
+    /// The current blend as a percentage (e.g. "50%"), kept in sync with `blend_trackbar` by
+    /// `refresh_blend_slider` and `on_blend_changed`.
+    #[nwg_control(parent: window, text: "50%")]
+    blend_value_label: nwg::Label,
+
     #[nwg_control(parent: window, flags: "VISIBLE", background_color: Some([255, 255, 255]))]
     image_frame: nwg::ImageFrame,
 
@@ -455,6 +485,12 @@ impl ImageViewer {
             .child_size(Size { width: D::Points(ROTATE_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .child(&self.auto_correct_button)
             .child_size(Size { width: D::Points(AUTO_CORRECT_BUTTON_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
+            .child(&self.blend_label)
+            .child_size(Size { width: D::Points(BLEND_LABEL_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
+            .child(&self.blend_trackbar)
+            .child_size(Size { width: D::Points(BLEND_TRACKBAR_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
+            .child(&self.blend_value_label)
+            .child_size(Size { width: D::Points(BLEND_VALUE_LABEL_WIDTH), height: D::Points(TOP_ROW_HEIGHT) })
             .build_partial(&self.top_row_layout)
             .expect("Failed to build the Image Viewer's top row layout");
 
@@ -621,6 +657,7 @@ impl ImageViewer {
         self.next_button.set_enabled(index + 1 < images.len());
         self.refresh_collection_buttons(&record.key);
         self.refresh_auto_correct_button(record);
+        self.refresh_blend_slider(record);
 
         drop(source_dir);
         drop(linked_images);
@@ -874,11 +911,33 @@ impl ImageViewer {
         self.auto_correct_button.set_enabled(!computing);
     }
 
+    /// Sets `blend_trackbar`/`blend_value_label` from `record`'s stored blend — enabled and at
+    /// its actual value while `record` has an active correction, disabled and reset to the 50%
+    /// position (the default a *new* correction would start at) otherwise. Called from
+    /// `show_current_image` alongside `refresh_auto_correct_button`, so it stays in sync on
+    /// every navigation the same way. Uses `set_trackbar_pos_silently` rather than
+    /// `nwg::TrackBar::set_pos`: `set_pos` sends `TBM_SETPOSNOTIFY`, which synchronously fires
+    /// the same `OnHorizontalScroll` a real user drag would — reentering `on_blend_changed`
+    /// while `show_current_image`'s own borrows of `self.images`/`self.linked_images` are still
+    /// held, which panics ("already borrowed") the moment `on_blend_changed` tries to
+    /// `borrow_mut()` them.
+    fn refresh_blend_slider(&self, record: &ImageRecord) {
+        let stored_blend = color_correction::from_record(record).map(|params| params.blend);
+        let enabled = stored_blend.is_some();
+        let blend = stored_blend.unwrap_or(color_correction::DEFAULT_BLEND);
+        let pos = color_correction::slider_pos_from_blend(blend);
+        set_trackbar_pos_silently(&self.blend_trackbar, pos);
+        self.blend_trackbar.set_enabled(enabled);
+        self.blend_value_label.set_text(&format!("{pos}%"));
+    }
+
     /// The Auto Correct checkbox: checking it computes a Simplest Color Balance
     /// brightness/contrast correction for the currently displayed photo (native or, if Toggle RAW
     /// is active, its counterpart — via `record_to_display`, same as `rotate_current_image`) and
-    /// persists it non-destructively; unchecking it deletes the stored correction immediately
-    /// (`clear_auto_correct`). The checked path runs on a background thread rather than
+    /// persists it non-destructively, starting at `color_correction::DEFAULT_BLEND` (the Blend
+    /// slider comes up enabled at 50%, via `refresh_blend_slider`); unchecking it deletes the
+    /// stored correction immediately (`clear_auto_correct`), disabling the slider again. The
+    /// checked path runs on a background thread rather than
     /// synchronously, since accurate clip points need a full-resolution decode + pixel pass,
     /// which `decode_and_fit`'s own doc comment measured at up to several seconds for a real
     /// photo; freezing the UI for that long is unacceptable. Mirrors `schedule_prefetch`'s
@@ -936,7 +995,9 @@ impl ImageViewer {
     /// in the database (`clear_image_color_correction`) and the matching in-memory record(s), the
     /// same two `find`/mutate blocks `rotate_current_image` uses — then redraws so the photo
     /// reverts to its uncorrected pixels immediately. Synchronous, unlike the checked path: no
-    /// decode is needed to remove six numbers.
+    /// decode is needed to remove seven numbers (the six clip points plus the blend fraction —
+    /// `refresh_blend_slider`, reached through `show_current_image` below, resets the Blend
+    /// slider back to its disabled 50% state).
     fn clear_auto_correct(&self, key: &str) {
         let db_path = self.db_path.borrow().clone();
         let db = match db::ProjectDb::open(&db_path) {
@@ -958,12 +1019,56 @@ impl ImageViewer {
             record.color_white_r = None;
             record.color_white_g = None;
             record.color_white_b = None;
+            record.color_blend = None;
         };
         if let Some(record) = self.images.borrow_mut().iter_mut().find(|r| r.key == key) {
             clear_fields(record);
         }
         if let Some(record) = self.linked_images.borrow_mut().values_mut().find(|r| r.key == key) {
             clear_fields(record);
+        }
+
+        self.image_cache.borrow_mut().clear();
+        self.prefetch_in_flight.borrow_mut().clear();
+        self.show_current_image();
+    }
+
+    /// The Blend trackbar (`OnHorizontalScroll`): re-derives the current photo's (native or, if
+    /// Toggle RAW is active, its counterpart's) blend fraction from the slider position and
+    /// persists it — cheap and synchronous, unlike `toggle_auto_correct`'s checked path, since
+    /// the clip points themselves aren't being recomputed, just re-blended with the original
+    /// pixels. Mirrors `rotate_current_image`'s two-`find`-block in-memory update and
+    /// `clear_auto_correct`'s invalidate-then-redraw sequence.
+    fn on_blend_changed(&self) {
+        let index = *self.current_index.borrow();
+        let showing_counterpart = *self.showing_counterpart.borrow();
+        let key = {
+            let images = self.images.borrow();
+            let linked_images = self.linked_images.borrow();
+            let Some(record) = record_to_display(&images, &linked_images, index, showing_counterpart) else { return };
+            record.key.clone()
+        };
+
+        let blend = color_correction::blend_from_slider_pos(self.blend_trackbar.pos());
+
+        let db_path = self.db_path.borrow().clone();
+        let db = match db::ProjectDb::open(&db_path) {
+            Ok(db) => db,
+            Err(err) => {
+                nwg::simple_message("PhotoMatic", &format!("Failed to open the database: {err}"));
+                return;
+            }
+        };
+        if let Err(err) = db.set_image_color_blend(&key, blend) {
+            nwg::simple_message("PhotoMatic", &format!("Failed to save blend: {err}"));
+            return;
+        }
+
+        if let Some(record) = self.images.borrow_mut().iter_mut().find(|r| r.key == key) {
+            record.color_blend = Some(blend);
+        }
+        if let Some(record) = self.linked_images.borrow_mut().values_mut().find(|r| r.key == key) {
+            record.color_blend = Some(blend);
         }
 
         self.image_cache.borrow_mut().clear();
@@ -999,7 +1104,10 @@ impl ImageViewer {
                 Some(params) => {
                     let db_path = self.db_path.borrow().clone();
                     match db::ProjectDb::open(&db_path) {
-                        Ok(db) => match db.set_image_color_correction(&result.key, &params) {
+                        Ok(db) => match db
+                            .set_image_color_correction(&result.key, &params)
+                            .and_then(|()| db.set_image_color_blend(&result.key, params.blend))
+                        {
                             Ok(()) => {
                                 let apply_params = |record: &mut ImageRecord| {
                                     record.color_black_r = Some(params.black[0]);
@@ -1008,6 +1116,7 @@ impl ImageViewer {
                                     record.color_white_r = Some(params.white[0]);
                                     record.color_white_g = Some(params.white[1]);
                                     record.color_white_b = Some(params.white[2]);
+                                    record.color_blend = Some(params.blend);
                                 };
                                 if let Some(record) = self.images.borrow_mut().iter_mut().find(|r| r.key == result.key) {
                                     apply_params(record);
@@ -1257,6 +1366,21 @@ pub(crate) fn swapped_for_rotation(size: (u32, u32), rotation_degrees: i32) -> (
     }
 }
 
+/// Sets a trackbar's position via raw `TBM_SETPOS`, unlike `nwg::TrackBar::set_pos` (which sends
+/// `TBM_SETPOSNOTIFY` and so synchronously fires the same scroll notification a real user drag
+/// would — see `refresh_blend_slider`'s doc comment for why that's unsafe to use for a
+/// programmatic sync). A no-op if the trackbar's handle isn't bound to a real `HWND` yet.
+fn set_trackbar_pos_silently(trackbar: &nwg::TrackBar, pos: usize) {
+    use winapi::um::commctrl::TBM_SETPOS;
+    use winapi::um::winuser::SendMessageW;
+
+    if let Some(hwnd) = trackbar.handle.hwnd() {
+        unsafe {
+            SendMessageW(hwnd, TBM_SETPOS, 1, pos as isize);
+        }
+    }
+}
+
 /// Rotates `frame` clockwise by `rotation_degrees` (0/90/180/270) via WIC's
 /// `IWICBitmapFlipRotator` — the same "wrap a WIC bitmap source, hand the wrapper back as a
 /// plain `ImageData`" technique `nwg::ImageDecoder::resize_image` uses internally for scaling
@@ -1320,10 +1444,12 @@ fn read_rgb24_pixels(image: &nwg::ImageData) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 /// Applies `params`'s per-channel Simplest Color Balance stretch to every pixel of `image`,
+/// blended by `params.blend` (via `color_correction::build_blended_lut` — the Blend slider),
 /// returning a new, real (`CreateBitmapFromMemory`-backed) `ImageData` in canonical 24bpp RGB —
 /// regardless of `image`'s own native pixel format, via `read_rgb24_pixels`. Shared by
 /// `decode_and_fit` (on-screen display) and `export::export_one` (recompressed export), so this
-/// pixel-walk/WIC-interop logic lives in exactly one place. `None` on any WIC failure, handled
+/// pixel-walk/WIC-interop logic lives in exactly one place, meaning both already automatically
+/// respect whatever blend is stored for the photo. `None` on any WIC failure, handled
 /// the same as every other stage in this pipeline (falls back to "preview unavailable" on
 /// display, an export error during export).
 pub(crate) fn apply_color_correction(
@@ -1337,9 +1463,9 @@ pub(crate) fn apply_color_correction(
     let (width, height, mut buffer) = read_rgb24_pixels(image)?;
 
     let luts = [
-        color_correction::build_lut(params.black[0], params.white[0]),
-        color_correction::build_lut(params.black[1], params.white[1]),
-        color_correction::build_lut(params.black[2], params.white[2]),
+        color_correction::build_blended_lut(params.black[0], params.white[0], params.blend),
+        color_correction::build_blended_lut(params.black[1], params.white[1], params.blend),
+        color_correction::build_blended_lut(params.black[2], params.white[2], params.blend),
     ];
     for pixel in buffer.chunks_exact_mut(3) {
         pixel[0] = luts[0][pixel[0] as usize];

@@ -20,7 +20,8 @@ fn migrations() -> &'static Migrations<'static> {
             M::up(include_str!("migrations/0012_add_collection_current_image.sql")),
             M::up(include_str!("migrations/0013_add_image_color_correction.sql")),
             M::up(include_str!("migrations/0014_add_image_corrected_date_taken.sql")),
-            // M::up(include_str!("migrations/0015_....sql")),  <- next migration goes here
+            M::up(include_str!("migrations/0015_add_image_color_blend.sql")),
+            // M::up(include_str!("migrations/0016_....sql")),  <- next migration goes here
         ])
     })
 }
@@ -141,5 +142,40 @@ mod tests {
         let corrected_date_taken: Option<String> =
             conn.query_row("SELECT corrected_date_taken FROM images WHERE key = 'a'", [], |row| row.get(0)).unwrap();
         assert_eq!(corrected_date_taken, None);
+    }
+
+    /// Migrations through 0013 already exercise a database that predates `color_blend`
+    /// (migration 0015) — a real project could have an Auto Correct-ed photo (six clip-point
+    /// columns set) from before this feature existed, which must keep looking exactly as it
+    /// does today, i.e. backfill to full strength rather than the new 50% default.
+    #[test]
+    fn upgrading_a_pre_blend_database_backfills_existing_corrections_to_full_strength() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrations_through_0013().to_latest(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO images (key, path, image_type, color_black_r, color_black_g, color_black_b, \
+             color_white_r, color_white_g, color_white_b) VALUES ('a', 'a.jpg', 'jpg', 1, 2, 3, 250, 251, 252)",
+            [],
+        )
+        .unwrap();
+
+        apply(&mut conn).unwrap();
+
+        let color_blend: Option<f64> =
+            conn.query_row("SELECT color_blend FROM images WHERE key = 'a'", [], |row| row.get(0)).unwrap();
+        assert_eq!(color_blend, Some(1.0));
+    }
+
+    #[test]
+    fn upgrading_a_pre_blend_database_leaves_an_uncorrected_image_null() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrations_through_0013().to_latest(&mut conn).unwrap();
+        conn.execute("INSERT INTO images (key, path, image_type) VALUES ('a', 'a.jpg', 'jpg')", []).unwrap();
+
+        apply(&mut conn).unwrap();
+
+        let color_blend: Option<f64> =
+            conn.query_row("SELECT color_blend FROM images WHERE key = 'a'", [], |row| row.get(0)).unwrap();
+        assert_eq!(color_blend, None);
     }
 }

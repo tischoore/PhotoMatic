@@ -47,14 +47,20 @@ pub struct ImageRecord {
     /// photo, wrapping back to 0 past 270. `None` means no rotation has ever been applied.
     pub rotation: Option<i32>,
     /// Simplest Color Balance low/high clip points (0-255) the Image Viewer's Auto Correct
-    /// button computed for this photo, one pair per RGB channel. `None` (on any of the six)
-    /// means Auto Correct has never been run — see `color_correction::from_record`.
+    /// button computed for this photo, one pair per RGB channel. `None` (on any of the seven,
+    /// `color_blend` included) means Auto Correct has never been run — see
+    /// `color_correction::from_record`.
     pub color_black_r: Option<u8>,
     pub color_black_g: Option<u8>,
     pub color_black_b: Option<u8>,
     pub color_white_r: Option<u8>,
     pub color_white_g: Option<u8>,
     pub color_white_b: Option<u8>,
+    /// How strongly the Simplest Color Balance stretch above is applied, from `0.0` (original
+    /// pixels) to `1.0` (the full stretch) — the Image Viewer's Blend slider. Defaults to
+    /// `color_correction::DEFAULT_BLEND` for a freshly computed correction; `None` under the
+    /// same all-or-nothing rule as the six columns above.
+    pub color_blend: Option<f64>,
 }
 
 /// A row in the `directories` table.

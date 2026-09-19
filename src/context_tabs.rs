@@ -120,6 +120,7 @@ mod tests {
             color_white_r: None,
             color_white_g: None,
             color_white_b: None,
+            color_blend: None,
         };
         assert_eq!(
             image_row(&record),
@@ -164,6 +165,7 @@ mod tests {
             color_white_r: None,
             color_white_g: None,
             color_white_b: None,
+            color_blend: None,
         };
         assert_eq!(
             image_row(&record),
