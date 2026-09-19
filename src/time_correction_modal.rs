@@ -226,10 +226,14 @@ struct ThumbnailCell {
 struct Lane {
     toplevel_dir: Option<String>,
     photos: Vec<ImageRecord>,
-    current_index: Cell<usize>,
-    /// Shows the directory name plus its live offset from the baseline lane (see
-    /// `refresh_lane_headers`) — text is refreshed on every thumbnail click, in this lane or any
-    /// other, since a click in the baseline lane shifts every other lane's displayed offset too.
+    /// Which photo is currently selected, or `None` if the user has deselected the lane entirely
+    /// (clicked its selected thumbnail a second time) — a deselected lane shows no outline on any
+    /// thumbnail and is excluded from the correction (see `select_thumbnail`).
+    current_index: Cell<Option<usize>>,
+    /// Shows the directory name plus its live offset from the baseline lane, or "not selected"
+    /// while the lane is deselected (see `refresh_lane_headers`) — text is refreshed on every
+    /// thumbnail click, in this lane or any other, since a click in the baseline lane shifts every
+    /// other lane's displayed offset too.
     dir_label: nwg::Label,
     status_label: nwg::Label,
     thumbnails: Vec<ThumbnailCell>,
@@ -577,11 +581,11 @@ impl TimeCorrectionDialog {
         }
     }
 
-    /// Gathers each lane's currently-selected photo and hands it to the pure
-    /// `time_correction::compute_offsets` — on success, stores the result and closes; on
-    /// failure (fewer than two lanes, or a lane's selection has no `corrected_date_taken` yet),
-    /// shows the error and leaves the dialog open so the user can fix it, the same
-    /// validate-then-close-or-explain shape `collection_modal::accept` uses.
+    /// Gathers each lane's currently-selected photo (and whether it's deselected entirely) and
+    /// hands it to the pure `time_correction::compute_offsets` — on success, stores the result
+    /// and closes; on failure (fewer than two lanes *included*, or an included lane's selection
+    /// has no `corrected_date_taken` yet), shows the error and leaves the dialog open so the user
+    /// can fix it, the same validate-then-close-or-explain shape `collection_modal::accept` uses.
     fn accept(&self) {
         let selections: Vec<LaneSelection> = self
             .lanes
@@ -590,7 +594,8 @@ impl TimeCorrectionDialog {
             .map(|lane| LaneSelection {
                 toplevel_dir: lane.toplevel_dir.clone(),
                 photo_count: lane.photos.len(),
-                selected_corrected_date_taken: lane.photos.get(lane.current_index.get()).and_then(|p| p.corrected_date_taken),
+                selected_corrected_date_taken: lane.current_index.get().and_then(|i| lane.photos.get(i)).and_then(|p| p.corrected_date_taken),
+                included: lane.current_index.get().is_some(),
             })
             .collect();
 
@@ -708,7 +713,7 @@ fn build_card(
     let mut status_label = nwg::Label::default();
     nwg::Label::builder()
         .parent(parent)
-        .text(&lane_status_text(&group.photos, 0))
+        .text(&lane_status_text(&group.photos, Some(0)))
         .position((card_x + CARD_PADDING as i32, status_y))
         .size((CARD_STRIP_VIEWPORT_WIDTH as i32, CARD_STATUS_HEIGHT as i32))
         .build(&mut status_label)
@@ -717,7 +722,7 @@ fn build_card(
     Lane {
         toplevel_dir: group.toplevel_dir,
         photos: group.photos,
-        current_index: Cell::new(0),
+        current_index: Cell::new(Some(0)),
         dir_label,
         status_label,
         thumbnails,
@@ -729,10 +734,14 @@ fn build_card(
     }
 }
 
-/// Moves `lane`'s selection to `new_index`: toggles the old and new `ThumbnailCell`'s outline
-/// visibility and updates the status label. No decode work at all — every photo's bitmap was
-/// already decoded into its own `ThumbnailCell` by `build_card`, so selecting is just two
-/// visibility toggles and a text update, unlike the old Prev/Next design's per-click re-decode.
+/// Handles a click on `lane`'s `clicked_index` thumbnail: if it's already the lane's selected
+/// photo, this is the *second* click on it, so the lane is deselected entirely (`new_index` is
+/// `None` — no thumbnail shows an outline, and the lane is excluded from the correction).
+/// Otherwise `clicked_index` becomes the new selection, whether the lane was previously deselected
+/// or had a different photo selected. Toggles the old and new `ThumbnailCell`'s outline visibility
+/// and updates the status label. No decode work at all — every photo's bitmap was already decoded
+/// into its own `ThumbnailCell` by `build_card`, so selecting is just two visibility toggles and a
+/// text update, unlike the old Prev/Next design's per-click re-decode.
 ///
 /// The outline is a plain `WS_BORDER` frame rather than a painted/colored highlight deliberately:
 /// this dialog can be opened repeatedly and a lane can hold hundreds of photos, and both
@@ -741,12 +750,13 @@ fn build_card(
 /// frames they're otherwise used for, but here it would leak one GDI brush per thumbnail per
 /// dialog open, eventually exhausting the process's GDI object quota app-wide. `set_visible` has
 /// no such cost.
-fn select_thumbnail(lane: &Lane, new_index: usize) {
+fn select_thumbnail(lane: &Lane, clicked_index: usize) {
     let old_index = lane.current_index.get();
-    if let Some(cell) = lane.thumbnails.get(old_index) {
+    if let Some(cell) = old_index.and_then(|index| lane.thumbnails.get(index)) {
         cell.outline.set_visible(false);
     }
-    if let Some(cell) = lane.thumbnails.get(new_index) {
+    let new_index = if old_index == Some(clicked_index) { None } else { Some(clicked_index) };
+    if let Some(cell) = new_index.and_then(|index| lane.thumbnails.get(index)) {
         cell.outline.set_visible(true);
     }
     lane.current_index.set(new_index);
@@ -754,18 +764,19 @@ fn select_thumbnail(lane: &Lane, new_index: usize) {
 }
 
 /// Recomputes and redraws every card's directory-name header with its live offset from the
-/// baseline lane (`0` for the baseline itself, signed `HH:MM:SS` for the rest, or a call-out when
-/// a selection has no `corrected_date_taken` yet) — called once `lanes` is fully built and again
-/// after every thumbnail click, since a click in the baseline lane changes every other lane's
-/// offset, not just the clicked one. Builds the same `LaneSelection` shape `accept` does, from
-/// each lane's currently selected photo.
+/// baseline lane (`0` for the baseline itself, signed `HH:MM:SS` for the rest, a call-out when a
+/// selection has no `corrected_date_taken` yet, or "not selected" for a deselected lane) — called
+/// once `lanes` is fully built and again after every thumbnail click, since a click in the
+/// baseline lane changes every other lane's offset, not just the clicked one. Builds the same
+/// `LaneSelection` shape `accept` does, from each lane's currently selected photo (or lack of one).
 fn refresh_lane_headers(lanes: &[Lane]) {
     let selections: Vec<LaneSelection> = lanes
         .iter()
         .map(|lane| LaneSelection {
             toplevel_dir: lane.toplevel_dir.clone(),
             photo_count: lane.photos.len(),
-            selected_corrected_date_taken: lane.photos.get(lane.current_index.get()).and_then(|p| p.corrected_date_taken),
+            selected_corrected_date_taken: lane.current_index.get().and_then(|i| lane.photos.get(i)).and_then(|p| p.corrected_date_taken),
+            included: lane.current_index.get().is_some(),
         })
         .collect();
 
@@ -777,9 +788,11 @@ fn refresh_lane_headers(lanes: &[Lane]) {
 
 /// The status label text under a lane's thumbnail strip: filename, position within the lane, and
 /// the selected photo's `corrected_date_taken` (or a call-out that it's missing, since that also
-/// means `compute_offsets` will reject this lane's current selection if left there). Pure so it's
-/// unit-testable without a window.
-fn lane_status_text(photos: &[ImageRecord], index: usize) -> String {
+/// means `compute_offsets` will reject this lane's current selection if left there) — or, when
+/// `index` is `None` (the lane has been deselected), a call-out that it's excluded from the
+/// correction entirely. Pure so it's unit-testable without a window.
+fn lane_status_text(photos: &[ImageRecord], index: Option<usize>) -> String {
+    let Some(index) = index else { return "Not part of the time correction".to_string() };
     let Some(photo) = photos.get(index) else { return String::new() };
     let filename = photo.path.rsplit('/').next().unwrap_or(photo.path.as_str());
     match photo.corrected_date_taken {
@@ -876,7 +889,7 @@ mod tests {
     fn lane_status_text_includes_filename_position_and_date() {
         let photos = vec![photo("50D/a.jpg", Some("2026-01-01 10:00:00")), photo("50D/b.jpg", Some("2026-01-01 10:05:00"))];
 
-        let text = lane_status_text(&photos, 1);
+        let text = lane_status_text(&photos, Some(1));
 
         assert!(text.contains("b.jpg"));
         assert!(text.contains("2 of 2"));
@@ -887,9 +900,18 @@ mod tests {
     fn lane_status_text_calls_out_a_missing_corrected_date() {
         let photos = vec![photo("50D/a.jpg", None)];
 
-        let text = lane_status_text(&photos, 0);
+        let text = lane_status_text(&photos, Some(0));
 
         assert!(text.contains("no date yet"));
+    }
+
+    #[test]
+    fn lane_status_text_calls_out_a_deselected_lane() {
+        let photos = vec![photo("50D/a.jpg", Some("2026-01-01 10:00:00"))];
+
+        let text = lane_status_text(&photos, None);
+
+        assert!(text.contains("Not part of the time correction"));
     }
 
     #[test]

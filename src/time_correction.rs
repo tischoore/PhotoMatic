@@ -45,43 +45,53 @@ pub fn group_lanes(images: Vec<ImageRecord>) -> Vec<LaneImages> {
 }
 
 /// One lane's contribution to `compute_offsets`: which directory it is, how many photos it
-/// holds (used to pick the baseline), and the `corrected_date_taken` of whichever photo the
-/// user currently has that lane's Prev/Next stepped to.
+/// holds (used to pick the baseline), the `corrected_date_taken` of whichever photo the user
+/// currently has that lane's Prev/Next stepped to, and whether the user has left the lane
+/// selected at all — a lane the user deselected (clicking its selected thumbnail a second time)
+/// has `included: false` and takes no part in `compute_offsets`/`lane_offsets`: it can't become
+/// the baseline, and it never appears in `compute_offsets`'s result, so its photos are left
+/// uncorrected by this run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaneSelection {
     pub toplevel_dir: Option<String>,
     pub photo_count: usize,
     pub selected_corrected_date_taken: Option<NaiveDateTime>,
+    pub included: bool,
 }
 
-/// Computes each non-baseline lane's `corrected_date_taken` offset from the photo the user has
-/// currently aligned it to, relative to the lane with the most photos (the baseline, implicitly
-/// offset zero and excluded from the result). Ties on photo count are broken by `toplevel_dir`
-/// ascending — `None` (the project-root bucket) wins a tie over any named directory, matching
-/// `group_lanes`'s ordering.
+/// Computes each non-baseline *included* lane's `corrected_date_taken` offset from the photo the
+/// user has currently aligned it to, relative to the included lane with the most photos (the
+/// baseline, implicitly offset zero and excluded from the result). Ties on photo count are broken
+/// by `toplevel_dir` ascending — `None` (the project-root bucket) wins a tie over any named
+/// directory, matching `group_lanes`'s ordering. A deselected (`included: false`) lane is skipped
+/// entirely: it's never eligible as baseline and never appears in the result, leaving its photos
+/// untouched by whatever `apply_time_corrections` does with this function's output.
 ///
 /// Each returned offset is `baseline's selection − that lane's selection`, meant to be *added*
 /// to `corrected_date_taken`.
 ///
 /// Errors (the message names the offending lane, for display via `nwg::modal_error_message`
-/// without closing the dialog) when: fewer than two lanes are given; the baseline lane's
-/// current selection has no `corrected_date_taken` yet; or any other lane's current selection
-/// doesn't either — in both of the latter cases, Generate MetaData hasn't run on that photo yet
-/// and there's nothing to align against.
+/// without closing the dialog) when: fewer than two lanes are *included*; the baseline lane's
+/// current selection has no `corrected_date_taken` yet; or any other included lane's current
+/// selection doesn't either — in both of the latter cases, Generate MetaData hasn't run on that
+/// photo yet and there's nothing to align against.
 pub fn compute_offsets(selections: &[LaneSelection]) -> Result<Vec<(Option<String>, Duration)>, String> {
-    if selections.len() < 2 {
-        return Err("At least two folders with photos are needed to set a time correction.".to_string());
+    let included: Vec<usize> = (0..selections.len()).filter(|&i| selections[i].included).collect();
+    if included.len() < 2 {
+        return Err("At least two included folders are needed to set a time correction.".to_string());
     }
 
-    let baseline = &selections[baseline_index(selections)];
+    let baseline_idx = baseline_index_among(selections, &included);
+    let baseline = &selections[baseline_idx];
 
     let baseline_dt = baseline.selected_corrected_date_taken.ok_or_else(|| missing_date_message(&baseline.toplevel_dir))?;
 
     let mut offsets = Vec::new();
-    for lane in selections {
-        if lane.toplevel_dir == baseline.toplevel_dir {
+    for &index in &included {
+        if index == baseline_idx {
             continue;
         }
+        let lane = &selections[index];
         let dt = lane.selected_corrected_date_taken.ok_or_else(|| missing_date_message(&lane.toplevel_dir))?;
         offsets.push((lane.toplevel_dir.clone(), baseline_dt - dt));
     }
@@ -95,20 +105,25 @@ pub fn compute_offsets(selections: &[LaneSelection]) -> Result<Vec<(Option<Strin
 /// other lane while the user works.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneOffset {
-    /// The lane with the most photos — always displayed as `0`, never computed against itself.
+    /// The included lane with the most photos — always displayed as `0`, never computed against
+    /// itself.
     Baseline,
     /// `baseline's selection − this lane's selection`, meant to be *added* to `corrected_date_taken`.
     Offset(Duration),
     /// Either the baseline's or this lane's current selection has no `corrected_date_taken` yet
     /// (Generate MetaData hasn't run on it), so no offset can be computed.
     Unknown,
+    /// The user deselected this lane (clicked its selected thumbnail a second time) — it takes no
+    /// part in the correction, isn't eligible as baseline, and is skipped by `compute_offsets`.
+    NotSelected,
 }
 
-/// The index into `selections` of the baseline lane: the one with the most photos, ties broken by
-/// `toplevel_dir` ascending (`None`/root wins a tie over any named directory) — shared by
-/// `compute_offsets` and `lane_offsets` so both agree on which lane is the baseline.
-fn baseline_index(selections: &[LaneSelection]) -> usize {
-    let mut ordered: Vec<usize> = (0..selections.len()).collect();
+/// The index, among `candidates` (indices into `selections`), of the one with the most photos,
+/// ties broken by `toplevel_dir` ascending (`None`/root wins a tie over any named directory) —
+/// shared by `compute_offsets` and `lane_offsets` so both agree on which lane is the baseline.
+/// `candidates` must not be empty.
+fn baseline_index_among(selections: &[LaneSelection], candidates: &[usize]) -> usize {
+    let mut ordered: Vec<usize> = candidates.to_vec();
     ordered.sort_by(|&a, &b| {
         selections[b].photo_count.cmp(&selections[a].photo_count).then_with(|| selections[a].toplevel_dir.cmp(&selections[b].toplevel_dir))
     });
@@ -118,18 +133,28 @@ fn baseline_index(selections: &[LaneSelection]) -> usize {
 /// One `LaneOffset` per lane in `selections`, same order, for the Set Time Correction dialog's
 /// card headers — recomputed on every thumbnail click (including in the baseline lane itself,
 /// which shifts every other lane's offset) so the headers always reflect the current selections.
+/// A deselected lane always renders as `NotSelected`; if no lane is included at all, every lane
+/// renders as `NotSelected` since there's no baseline to compute anything against.
 pub fn lane_offsets(selections: &[LaneSelection]) -> Vec<LaneOffset> {
     if selections.is_empty() {
         return Vec::new();
     }
 
-    let baseline_idx = baseline_index(selections);
+    let included: Vec<usize> = (0..selections.len()).filter(|&i| selections[i].included).collect();
+    if included.is_empty() {
+        return selections.iter().map(|_| LaneOffset::NotSelected).collect();
+    }
+
+    let baseline_idx = baseline_index_among(selections, &included);
     let baseline_dt = selections[baseline_idx].selected_corrected_date_taken;
 
     selections
         .iter()
         .enumerate()
         .map(|(index, lane)| {
+            if !lane.included {
+                return LaneOffset::NotSelected;
+            }
             if index == baseline_idx {
                 return LaneOffset::Baseline;
             }
@@ -142,13 +167,14 @@ pub fn lane_offsets(selections: &[LaneSelection]) -> Vec<LaneOffset> {
 }
 
 /// Renders a `LaneOffset` for display in a card header: `"0"` for the baseline, a signed
-/// `HH:MM:SS` for a computed offset, or a call-out matching `lane_status_text`'s wording when the
-/// offset can't be computed yet.
+/// `HH:MM:SS` for a computed offset, a call-out matching `lane_status_text`'s wording when the
+/// offset can't be computed yet, or `"not selected"` when the user has deselected the lane.
 pub fn format_lane_offset(offset: LaneOffset) -> String {
     match offset {
         LaneOffset::Baseline => "0".to_string(),
         LaneOffset::Offset(duration) => format_offset(duration),
         LaneOffset::Unknown => "no date yet".to_string(),
+        LaneOffset::NotSelected => "not selected".to_string(),
     }
 }
 
@@ -234,13 +260,45 @@ mod tests {
             toplevel_dir: toplevel_dir.map(|s| s.to_string()),
             photo_count,
             selected_corrected_date_taken: selected.map(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()),
+            included: true,
         }
+    }
+
+    fn excluded(mut lane: LaneSelection) -> LaneSelection {
+        lane.included = false;
+        lane
     }
 
     #[test]
     fn compute_offsets_errors_with_fewer_than_two_lanes() {
         let selections = vec![selection(Some("50D"), 10, Some("2026-01-01 10:00:00"))];
         assert!(compute_offsets(&selections).is_err());
+    }
+
+    #[test]
+    fn compute_offsets_errors_with_fewer_than_two_included_lanes() {
+        let selections = vec![
+            selection(Some("50D"), 10, Some("2026-01-01 10:00:00")),
+            excluded(selection(Some("40D"), 5, Some("2026-01-01 10:00:00"))),
+        ];
+        assert!(compute_offsets(&selections).is_err());
+    }
+
+    #[test]
+    fn compute_offsets_skips_an_excluded_lane_entirely() {
+        let selections = vec![
+            selection(Some("50D"), 10, Some("2026-01-01 12:00:00")),
+            selection(Some("40D"), 3, Some("2026-01-01 11:30:00")),
+            excluded(selection(Some("60D"), 20, Some("2026-01-01 09:00:00"))),
+        ];
+
+        let offsets = compute_offsets(&selections).unwrap();
+
+        // 60D has the most photos but is excluded, so it neither becomes the baseline nor
+        // receives an offset; 50D (the largest included lane) is the baseline instead.
+        assert_eq!(offsets.len(), 1);
+        assert_eq!(offsets[0].0, Some("40D".to_string()));
+        assert_eq!(offsets[0].1, Duration::minutes(30));
     }
 
     #[test]
@@ -364,11 +422,35 @@ mod tests {
     }
 
     #[test]
+    fn lane_offsets_marks_a_deselected_lane_not_selected_and_ineligible_as_baseline() {
+        let selections = vec![
+            selection(Some("50D"), 10, Some("2026-01-01 12:00:00")),
+            excluded(selection(Some("60D"), 20, Some("2026-01-01 09:00:00"))),
+        ];
+
+        let offsets = lane_offsets(&selections);
+
+        // 60D has more photos but is excluded, so 50D (the only included lane) is the baseline.
+        assert_eq!(offsets[0], LaneOffset::Baseline);
+        assert_eq!(offsets[1], LaneOffset::NotSelected);
+    }
+
+    #[test]
+    fn lane_offsets_is_all_not_selected_when_no_lane_is_included() {
+        let selections = vec![excluded(selection(Some("50D"), 10, Some("2026-01-01 10:00:00"))), excluded(selection(Some("40D"), 5, None))];
+
+        let offsets = lane_offsets(&selections);
+
+        assert_eq!(offsets, vec![LaneOffset::NotSelected, LaneOffset::NotSelected]);
+    }
+
+    #[test]
     fn format_lane_offset_renders_each_variant() {
         assert_eq!(format_lane_offset(LaneOffset::Baseline), "0");
         assert_eq!(format_lane_offset(LaneOffset::Offset(Duration::minutes(5))), "+00:05:00");
         assert_eq!(format_lane_offset(LaneOffset::Offset(Duration::hours(-1))), "-01:00:00");
         assert_eq!(format_lane_offset(LaneOffset::Unknown), "no date yet");
+        assert_eq!(format_lane_offset(LaneOffset::NotSelected), "not selected");
     }
 
     #[test]
