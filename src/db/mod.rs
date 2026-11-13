@@ -7,7 +7,7 @@ pub mod models;
 mod project_settings;
 
 pub use collections::DEFAULT_COLLECTION_DESCRIPTION;
-pub use events::EventThresholds;
+pub use events::{EventThresholds, MergePlan};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -210,11 +210,21 @@ impl ProjectDb {
         images::list_images_by_directory(&self.conn, toplevel_dir, image_type)
     }
 
-    /// Clears and rebuilds the `events`/`event_images` tables from `images`, clustered at
-    /// all three tiers (Tight Burst, Session, Multi-hour) per `thresholds` — backs the
-    /// "Generate Events" button.
-    pub fn regenerate_events(&mut self, images: &[models::ImageRecord], thresholds: &EventThresholds) -> Result<(), DbError> {
-        events::regenerate(&mut self.conn, images, thresholds)
+    /// Diffs a fresh clustering of `images` at all three tiers (Tight Burst, Session,
+    /// Multi-hour) against the events already in the database, without writing anything yet —
+    /// backs the "Generate Events" button. Pass the result to `apply_event_regeneration` once
+    /// any destructive part of it (`MergePlan.discarded_edited_titles`) has been confirmed.
+    pub fn plan_event_regeneration(
+        &self,
+        images: &[models::ImageRecord],
+        thresholds: &EventThresholds,
+    ) -> Result<MergePlan, DbError> {
+        events::plan_regeneration(&self.conn, images, thresholds)
+    }
+
+    /// Writes a previously computed `MergePlan` to the `events`/`event_images` tables.
+    pub fn apply_event_regeneration(&mut self, plan: MergePlan) -> Result<(), DbError> {
+        events::apply_plan(&mut self.conn, plan)
     }
 
     /// Every generated event with its photo count, chronologically ordered — backs the
@@ -236,12 +246,6 @@ impl ProjectDb {
     /// Writes a user-edited title/notes back to one event.
     pub fn update_event(&self, event_id: i64, title: &str, notes: &str) -> Result<(), DbError> {
         events::update_event(&self.conn, event_id, title, notes)
-    }
-
-    /// Whether any event currently holds a user-entered title or notes — backs the warning
-    /// Generate Events shows before a rebuild would silently erase them.
-    pub fn has_edited_events(&self) -> Result<bool, DbError> {
-        events::has_edited_events(&self.conn)
     }
 
     /// Ensures the project's default collection exists (named `name`) and links every

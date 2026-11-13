@@ -1,3 +1,5 @@
+use std::collections::{BTreeSet, HashSet};
+
 use chrono::Duration;
 use rusqlite::{Connection, OptionalExtension};
 
@@ -18,40 +20,206 @@ pub struct EventThresholds {
     pub multi_hour_max_distance_km: f64,
 }
 
-/// Clears `event_images` and `events`, then re-clusters `images` at all three tiers
-/// (Tight Burst, Session, Multi-hour) and writes the results back — all in one
-/// transaction, so a failure never leaves a partially rebuilt table. A tier only
-/// produces an `events` row for a group of 2 or more photos; a photo with no neighbor
-/// within a tier's threshold simply gets no row for that tier.
-pub fn regenerate(conn: &mut Connection, images: &[ImageRecord], thresholds: &EventThresholds) -> Result<(), DbError> {
+/// One `events` row as it exists in the database right now, together with the full set of
+/// image keys currently linked to it — the "before" state `plan` diffs a fresh clustering
+/// against, so an unchanged group can be left alone instead of deleted and reinserted.
+struct ExistingEvent {
+    id: i64,
+    event_type: EventType,
+    title: String,
+    notes: String,
+    image_keys: BTreeSet<String>,
+}
+
+impl ExistingEvent {
+    /// Whether a user has actually typed something into this event: the title no longer
+    /// matches the plain photo-count default every event starts with, or notes is non-empty.
+    /// Backs `MergePlan.discarded_edited_titles`, the per-event replacement for the old
+    /// project-wide `has_edited_events` check.
+    fn is_edited(&self) -> bool {
+        !self.notes.is_empty() || self.title != default_title(self.image_keys.len())
+    }
+}
+
+/// What bringing `events`/`event_images` in line with a fresh clustering actually requires —
+/// computed by `plan` (pure, no database access) so the app layer can inspect
+/// `discarded_edited_titles` and ask for confirmation *before* `apply_plan` writes anything.
+#[derive(Default)]
+pub struct MergePlan {
+    inserts: Vec<(EventType, BTreeSet<String>)>,
+    /// `(event_id, new full image-key set, new title if the old one was still the plain
+    /// default)` — covers both a group simply gaining members and a merge, where the
+    /// lowest-id existing event survives and absorbs every merged group's photos.
+    extends: Vec<(i64, BTreeSet<String>, Option<String>)>,
+    removes: Vec<i64>,
+    /// Titles of events this plan deletes (merged away or no longer produced by any tier)
+    /// that had a user edit worth warning about before applying.
+    pub discarded_edited_titles: Vec<String>,
+}
+
+impl MergePlan {
+    /// Whether applying this plan would discard any user-entered title/notes — the app layer's
+    /// cue to confirm before calling `apply_plan`.
+    pub fn is_destructive(&self) -> bool {
+        !self.discarded_edited_titles.is_empty()
+    }
+}
+
+/// A plain count of what a `regenerate` run actually did — enough for its own direct callers
+/// (mainly this module's tests) without needing the full `MergePlan`.
+#[derive(Debug, Default, PartialEq)]
+pub struct MergeSummary {
+    pub inserted: usize,
+    pub extended: usize,
+    pub removed: usize,
+    pub discarded_edited_titles: Vec<String>,
+}
+
+/// Reads every current `events` row together with its linked image keys, grouped in Rust
+/// (rows arrive already contiguous per event since the query orders by `e.id`).
+fn load_existing(conn: &Connection) -> Result<Vec<ExistingEvent>, DbError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.id, e.event_type, e.title, e.notes, ei.image_key \
+             FROM events e JOIN event_images ei ON ei.event_id = e.id \
+             ORDER BY e.id",
+        )
+        .map_err(DbError::Sqlite)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?))
+        })
+        .map_err(DbError::Sqlite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DbError::Sqlite)?;
+
+    let mut existing: Vec<ExistingEvent> = Vec::new();
+    for (id, event_type, title, notes, image_key) in rows {
+        match existing.last_mut() {
+            Some(last) if last.id == id => {
+                last.image_keys.insert(image_key);
+            }
+            _ => {
+                let mut image_keys = BTreeSet::new();
+                image_keys.insert(image_key);
+                existing.push(ExistingEvent { id, event_type: parse_event_type(&event_type), title, notes, image_keys });
+            }
+        }
+    }
+    Ok(existing)
+}
+
+/// Diffs a fresh clustering of `images` at all three tiers (Tight Burst, Session, Multi-hour)
+/// against `existing` and returns what needs to change — never what's already correct. For
+/// each tier's groups of 2+ photos:
+/// - No existing event overlaps it → a brand new event.
+/// - Exactly one existing event overlaps and its membership is unchanged → left alone entirely.
+/// - Exactly one existing event overlaps and the group only grew (clustering by time gap can
+///   only ever grow or merge a group as more images are added, never shrink or split one) →
+///   that event keeps its id/notes, its `event_images` extend to the new membership, and its
+///   title updates to the new count only if it was still the plain default (never overwriting
+///   a user's own title).
+/// - More than one existing event overlaps (two previously separate groups got bridged by a
+///   new photo) → the lowest-id event survives and absorbs every photo, the rest are deleted.
+///
+/// Any existing event never produced by any tier at all (can happen when a time correction
+/// reshuffles `corrected_date_taken`, not just when photos are added) is deleted as an orphan.
+/// A deleted event that `is_edited()` contributes its title to `discarded_edited_titles`.
+fn plan(existing: Vec<ExistingEvent>, images: &[ImageRecord], thresholds: &EventThresholds) -> MergePlan {
+    let mut merge_plan = MergePlan::default();
+    let mut matched: HashSet<i64> = HashSet::new();
+    let mut removed: HashSet<i64> = HashSet::new();
+
+    for (event_type, gap, max_distance_km) in [
+        (EventType::TightBurst, thresholds.burst, None),
+        (EventType::Session, thresholds.session, Some(thresholds.session_max_distance_km)),
+        (EventType::MultiHour, thresholds.multi_hour, Some(thresholds.multi_hour_max_distance_km)),
+    ] {
+        for group in cluster_by_time_gap(images, gap, max_distance_km) {
+            if group.len() < 2 {
+                continue;
+            }
+            let new_keys: BTreeSet<String> = group.iter().map(|i| i.key.clone()).collect();
+
+            let overlapping: Vec<&ExistingEvent> =
+                existing.iter().filter(|e| e.event_type == event_type && !e.image_keys.is_disjoint(&new_keys)).collect();
+
+            match overlapping.as_slice() {
+                [] => merge_plan.inserts.push((event_type, new_keys)),
+                [one] if one.image_keys == new_keys => {
+                    matched.insert(one.id);
+                }
+                _ => {
+                    let survivor = overlapping.iter().min_by_key(|e| e.id).unwrap();
+                    matched.insert(survivor.id);
+                    let new_title =
+                        (survivor.title == default_title(survivor.image_keys.len())).then(|| default_title(new_keys.len()));
+                    merge_plan.extends.push((survivor.id, new_keys, new_title));
+
+                    for other in overlapping.iter().filter(|e| e.id != survivor.id) {
+                        if removed.insert(other.id) {
+                            merge_plan.removes.push(other.id);
+                            if other.is_edited() {
+                                merge_plan.discarded_edited_titles.push(other.title.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for event in &existing {
+        if !matched.contains(&event.id) && removed.insert(event.id) {
+            merge_plan.removes.push(event.id);
+            if event.is_edited() {
+                merge_plan.discarded_edited_titles.push(event.title.clone());
+            }
+        }
+    }
+
+    merge_plan
+}
+
+/// Executes a `MergePlan`: inserts new events, extends existing ones' `event_images` to their
+/// new membership (updating title only where the plan says to), and deletes merged-away or
+/// orphaned events together with their `event_images` rows (no `ON DELETE CASCADE` on that
+/// foreign key, so this is done explicitly). All in one transaction, so a failure never leaves
+/// things half-applied.
+fn apply(conn: &mut Connection, merge_plan: MergePlan) -> Result<(), DbError> {
     let tx = conn.transaction().map_err(DbError::Sqlite)?;
-    tx.execute("DELETE FROM event_images", []).map_err(DbError::Sqlite)?;
-    tx.execute("DELETE FROM events", []).map_err(DbError::Sqlite)?;
+
+    for id in &merge_plan.removes {
+        tx.execute("DELETE FROM event_images WHERE event_id = ?1", rusqlite::params![id]).map_err(DbError::Sqlite)?;
+        tx.execute("DELETE FROM events WHERE id = ?1", rusqlite::params![id]).map_err(DbError::Sqlite)?;
+    }
 
     {
-        let mut insert_event = tx
-            .prepare("INSERT INTO events (event_type, notes, title) VALUES (?1, '', ?2)")
-            .map_err(DbError::Sqlite)?;
-        let mut insert_link = tx
-            .prepare("INSERT INTO event_images (event_id, image_key) VALUES (?1, ?2)")
-            .map_err(DbError::Sqlite)?;
+        let mut insert_event =
+            tx.prepare("INSERT INTO events (event_type, notes, title) VALUES (?1, '', ?2)").map_err(DbError::Sqlite)?;
+        let mut insert_link =
+            tx.prepare("INSERT INTO event_images (event_id, image_key) VALUES (?1, ?2)").map_err(DbError::Sqlite)?;
+        for (event_type, keys) in &merge_plan.inserts {
+            insert_event.execute(rusqlite::params![event_type.to_string(), default_title(keys.len())]).map_err(DbError::Sqlite)?;
+            let event_id = tx.last_insert_rowid();
+            for key in keys {
+                insert_link.execute(rusqlite::params![event_id, key]).map_err(DbError::Sqlite)?;
+            }
+        }
+    }
 
-        for (event_type, gap, max_distance_km) in [
-            (EventType::TightBurst, thresholds.burst, None),
-            (EventType::Session, thresholds.session, Some(thresholds.session_max_distance_km)),
-            (EventType::MultiHour, thresholds.multi_hour, Some(thresholds.multi_hour_max_distance_km)),
-        ] {
-            for group in cluster_by_time_gap(images, gap, max_distance_km) {
-                if group.len() < 2 {
-                    continue;
-                }
-                insert_event
-                    .execute(rusqlite::params![event_type.to_string(), default_title(group.len())])
-                    .map_err(DbError::Sqlite)?;
-                let event_id = tx.last_insert_rowid();
-                for image in &group {
-                    insert_link.execute(rusqlite::params![event_id, image.key]).map_err(DbError::Sqlite)?;
-                }
+    {
+        let mut delete_links = tx.prepare("DELETE FROM event_images WHERE event_id = ?1").map_err(DbError::Sqlite)?;
+        let mut insert_link =
+            tx.prepare("INSERT INTO event_images (event_id, image_key) VALUES (?1, ?2)").map_err(DbError::Sqlite)?;
+        let mut update_title = tx.prepare("UPDATE events SET title = ?2 WHERE id = ?1").map_err(DbError::Sqlite)?;
+        for (id, keys, new_title) in &merge_plan.extends {
+            delete_links.execute(rusqlite::params![id]).map_err(DbError::Sqlite)?;
+            for key in keys {
+                insert_link.execute(rusqlite::params![id, key]).map_err(DbError::Sqlite)?;
+            }
+            if let Some(title) = new_title {
+                update_title.execute(rusqlite::params![title, id]).map_err(DbError::Sqlite)?;
             }
         }
     }
@@ -59,12 +227,41 @@ pub fn regenerate(conn: &mut Connection, images: &[ImageRecord], thresholds: &Ev
     tx.commit().map_err(DbError::Sqlite)
 }
 
+/// Reads the database's current events and diffs a fresh clustering of `images` against them
+/// (see `plan`) — the read half of a regeneration, split out so the app layer can inspect
+/// `MergePlan.discarded_edited_titles` and confirm before `apply_plan` writes anything.
+pub fn plan_regeneration(conn: &Connection, images: &[ImageRecord], thresholds: &EventThresholds) -> Result<MergePlan, DbError> {
+    let existing = load_existing(conn)?;
+    Ok(plan(existing, images, thresholds))
+}
+
+/// Writes a previously computed `MergePlan` to the database.
+pub fn apply_plan(conn: &mut Connection, merge_plan: MergePlan) -> Result<(), DbError> {
+    apply(conn, merge_plan)
+}
+
+/// Convenience wrapper for callers that don't need to confirm anything before writing (this
+/// module's own tests, mainly): plans and immediately applies a regeneration in one call.
+pub fn regenerate(conn: &mut Connection, images: &[ImageRecord], thresholds: &EventThresholds) -> Result<MergeSummary, DbError> {
+    let existing = load_existing(conn)?;
+    let merge_plan = plan(existing, images, thresholds);
+    let summary = MergeSummary {
+        inserted: merge_plan.inserts.len(),
+        extended: merge_plan.extends.len(),
+        removed: merge_plan.removes.len(),
+        discarded_edited_titles: merge_plan.discarded_edited_titles.clone(),
+    };
+    apply(conn, merge_plan)?;
+    Ok(summary)
+}
+
 /// Removes one image from every event it belongs to — backs the Image Viewer's Delete button.
 /// Any `events` row left with zero remaining `event_images` rows is left as an orphan rather
-/// than cleaned up here: `regenerate` is the only thing that rebuilds `events` from scratch,
-/// and `list_events`'s inner join already excludes a zero-photo event from the views that
-/// matter. The `images` row itself is left untouched, so a later Generate Events run
-/// re-clusters the image if it's still eligible.
+/// than cleaned up here: `plan`'s orphan-removal pass deletes it on the next regeneration
+/// (it can no longer overlap any freshly clustered group), and `list_events`'s inner join
+/// already excludes a zero-photo event from the views that matter in the meantime. The
+/// `images` row itself is left untouched, so a later Generate Events run re-clusters the
+/// image if it's still eligible.
 pub fn remove_image_from_all_events(conn: &Connection, image_key: &str) -> Result<(), DbError> {
     conn.execute("DELETE FROM event_images WHERE image_key = ?1", rusqlite::params![image_key])
         .map_err(DbError::Sqlite)?;
@@ -143,24 +340,6 @@ pub fn update_event(conn: &Connection, event_id: i64, title: &str, notes: &str) 
     )
     .map_err(DbError::Sqlite)?;
     Ok(())
-}
-
-/// Whether any event currently holds a user edit — a title that no longer matches its
-/// default (the photo count `regenerate` gave it) or non-empty notes. `regenerate`
-/// unconditionally deletes and rebuilds every event, so this backs the confirmation
-/// prompt Generate Events shows before it would silently discard those edits.
-pub fn has_edited_events(conn: &Connection) -> Result<bool, DbError> {
-    conn.query_row(
-        "SELECT EXISTS ( \
-             SELECT 1 FROM events e \
-             JOIN (SELECT event_id, COUNT(*) c FROM event_images GROUP BY event_id) counts \
-                 ON counts.event_id = e.id \
-             WHERE e.notes != '' OR e.title != CAST(counts.c AS TEXT) \
-         )",
-        [],
-        |row| row.get::<_, bool>(0),
-    )
-    .map_err(DbError::Sqlite)
 }
 
 #[cfg(test)]
@@ -427,32 +606,99 @@ mod tests {
         assert!(get_event(&conn, 999).unwrap().is_none());
     }
 
-    #[test]
-    fn has_edited_events_is_false_right_after_a_regenerate() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        crate::db::migrations::apply(&mut conn).unwrap();
-
-        let images = vec![image_at("a", 10, 0), image_at("b", 10, 30)];
-        seed_images(&mut conn, &images);
-        regenerate(&mut conn, &images, &thresholds()).unwrap();
-
-        assert!(!has_edited_events(&conn).unwrap());
+    /// Builds an `ExistingEvent` directly (no database needed) — `plan` is pure, so its tests
+    /// don't need to seed a real `events` table first.
+    fn existing_event(id: i64, event_type: EventType, title: &str, keys: &[&str]) -> ExistingEvent {
+        ExistingEvent { id, event_type, title: title.to_string(), notes: String::new(), image_keys: keys.iter().map(|k| k.to_string()).collect() }
     }
 
     #[test]
-    fn has_edited_events_is_true_once_a_title_or_notes_has_been_edited() {
+    fn plan_leaves_an_unchanged_group_completely_alone() {
+        let existing = vec![existing_event(1, EventType::Session, "2", &["a", "b"])];
+        let images = vec![image_at("a", 10, 0), image_at("b", 10, 30)];
+
+        let plan = plan(existing, &images, &thresholds());
+
+        // Only the Session tier reproduces {a, b} unchanged; Multi-hour reproduces it too but
+        // as a brand new event, since no existing Multi-hour event was seeded.
+        assert!(plan.extends.is_empty());
+        assert!(plan.removes.is_empty());
+        assert!(plan.discarded_edited_titles.is_empty());
+        assert_eq!(plan.inserts.len(), 1, "the Multi-hour tier still needs a new event");
+    }
+
+    #[test]
+    fn plan_extends_a_group_that_gained_a_photo_and_updates_its_default_title() {
+        let existing = vec![existing_event(1, EventType::Session, "2", &["a", "b"])];
+        let images = vec![image_at("a", 10, 0), image_at("b", 10, 30), image_at("c", 10, 45)];
+
+        let plan = plan(existing, &images, &thresholds());
+
+        let extend = plan.extends.iter().find(|(id, ..)| *id == 1).expect("event 1 should extend");
+        assert_eq!(extend.1, BTreeSet::from(["a".to_string(), "b".to_string(), "c".to_string()]));
+        assert_eq!(extend.2, Some("3".to_string()));
+        assert!(plan.discarded_edited_titles.is_empty());
+    }
+
+    #[test]
+    fn plan_extending_a_group_with_an_edited_title_preserves_it() {
+        let existing = vec![existing_event(1, EventType::Session, "Birthday Party", &["a", "b"])];
+        let images = vec![image_at("a", 10, 0), image_at("b", 10, 30), image_at("c", 10, 45)];
+
+        let plan = plan(existing, &images, &thresholds());
+
+        let extend = plan.extends.iter().find(|(id, ..)| *id == 1).expect("event 1 should extend");
+        assert_eq!(extend.2, None, "an edited title should never be overwritten");
+    }
+
+    #[test]
+    fn plan_merges_two_bridged_events_keeping_the_lower_id_and_reporting_the_others_edited_title() {
+        let existing = vec![
+            existing_event(1, EventType::Session, "2", &["a", "b"]),
+            existing_event(5, EventType::Session, "Vacation", &["d", "e"]),
+        ];
+        // c bridges a/b (10:00-10:30) and d/e (11:00-11:30) into one Session group.
+        let images = vec![
+            image_at("a", 10, 0),
+            image_at("b", 10, 30),
+            image_at("c", 10, 45),
+            image_at("d", 11, 0),
+            image_at("e", 11, 30),
+        ];
+
+        let plan = plan(existing, &images, &thresholds());
+
+        let extend = plan.extends.iter().find(|(id, ..)| *id == 1).expect("event 1 should survive as the merge target");
+        assert_eq!(extend.1, ["a", "b", "c", "d", "e"].map(String::from).into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(plan.removes, vec![5]);
+        assert_eq!(plan.discarded_edited_titles, vec!["Vacation".to_string()]);
+    }
+
+    #[test]
+    fn plan_deletes_an_orphaned_event_no_tier_reproduces_and_reports_its_edited_title() {
+        // "a" and "b" used to cluster together, but corrected_date_taken has since moved them
+        // 8 hours apart — no tier reclusters them, so the old event is a pure orphan now.
+        let existing = vec![existing_event(1, EventType::Session, "Renamed", &["a", "b"])];
+        let images = vec![image_at("a", 0, 0), image_at("b", 8, 0)];
+
+        let plan = plan(existing, &images, &thresholds());
+
+        assert_eq!(plan.removes, vec![1]);
+        assert_eq!(plan.discarded_edited_titles, vec!["Renamed".to_string()]);
+    }
+
+    #[test]
+    fn regenerate_via_plan_and_apply_matches_the_original_wipe_and_rebuild_behavior() {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::db::migrations::apply(&mut conn).unwrap();
 
         let images = vec![image_at("a", 10, 0), image_at("b", 10, 30)];
         seed_images(&mut conn, &images);
-        regenerate(&mut conn, &images, &thresholds()).unwrap();
-        let event_id = list_events(&conn).unwrap()[0].id;
+        let first = regenerate(&mut conn, &images, &thresholds()).unwrap();
+        assert_eq!(first, MergeSummary { inserted: 2, extended: 0, removed: 0, discarded_edited_titles: vec![] });
 
-        update_event(&conn, event_id, "Birthday Party", "").unwrap();
-        assert!(has_edited_events(&conn).unwrap());
-
-        update_event(&conn, event_id, "2", "Great weather").unwrap();
-        assert!(has_edited_events(&conn).unwrap());
+        // Regenerating again with the same images changes nothing — every group is unchanged.
+        let second = regenerate(&mut conn, &images, &thresholds()).unwrap();
+        assert_eq!(second, MergeSummary { inserted: 0, extended: 0, removed: 0, discarded_edited_titles: vec![] });
     }
 }

@@ -388,6 +388,14 @@ pub struct App {
     #[nwg_events(OnMenuItemSelected: [App::open_add_collection])]
     edit_add_collection: nwg::MenuItem,
 
+    /// Scans one new top-level subdirectory of the Source Directory instead of the whole
+    /// tree, and merges its photos into events incrementally rather than wiping the
+    /// project's events — see `open_add_camera_directory`. No accelerator per `CLAUDE.md`:
+    /// no Windows-standard key combination exists for this action, so mnemonic only.
+    #[nwg_control(parent: edit_menu, text: "Add Camera &Directory...")]
+    #[nwg_events(OnMenuItemSelected: [App::open_add_camera_directory])]
+    edit_add_camera_directory: nwg::MenuItem,
+
     #[nwg_control(parent: edit_menu)]
     edit_menu_sep: nwg::MenuSeparator,
 
@@ -2311,6 +2319,82 @@ impl App {
         self.refresh_events_button_enabled();
     }
 
+    /// Edit > Add Camera Directory...: scans exactly one top-level subdirectory of the Source
+    /// Directory instead of walking the whole tree — the scoped counterpart to Scan Directory,
+    /// for picking up a newly added camera's photos without re-walking every already-scanned
+    /// directory. `finish_scan` still runs afterward (same as a full scan): it's pure SQL, not
+    /// per-file disk/EXIF I/O, so re-deriving RAW/compressed links and default-collection
+    /// membership for the whole project stays cheap. Reuses `scan_thread`/`scan_notice`/
+    /// `scan_finished`, the same infrastructure `start_scan` uses, which also rejects a second
+    /// concurrent scan of either kind for free.
+    fn open_add_camera_directory(&self) {
+        if self.scan_thread.borrow().is_some() {
+            return;
+        }
+
+        self.sync_source_directory_from_input();
+        let project = self.project.borrow();
+        let Some(root) = project.source_directory.clone() else {
+            nwg::simple_message("PhotoMatic", "Please choose a Source Directory before adding a camera.");
+            return;
+        };
+        let extensions = project.file_extensions.clone();
+        let link_raw_images = project.link_raw_images;
+        drop(project);
+
+        let mut dialog = nwg::FileDialog::default();
+        let builder = nwg::FileDialog::builder()
+            .title("Select the new camera's directory")
+            .action(nwg::FileDialogAction::OpenDirectory)
+            .default_folder(root.to_string_lossy().to_string());
+        if builder.build(&mut dialog).is_err() {
+            return;
+        }
+        if !dialog.run(Some(&self.window)) {
+            return;
+        }
+        let Ok(selected) = dialog.get_selected_item() else { return };
+        let selected = PathBuf::from(selected);
+
+        if selected.parent() != Some(root.as_path()) {
+            nwg::simple_message(
+                "PhotoMatic",
+                "Please choose a folder directly inside the Source Directory — nested camera folders aren't supported.",
+            );
+            return;
+        }
+        let Some(dir_name) = selected.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            return;
+        };
+
+        // Moved into the closure alongside `root`/`dir_name`/`extensions`, the same
+        // ownership-transfer idiom `start_scan` uses — see its comment for why the DB writes
+        // happen on this thread rather than being handed back to the UI thread first.
+        let db = self.db.borrow_mut().take();
+
+        self.scan_button.set_enabled(false);
+        self.scan_progress.set_visible(true);
+
+        let sender = self.scan_notice.sender();
+        let handle = thread::spawn(move || {
+            let mut db = db;
+            let start = std::time::Instant::now();
+            let unit = scan::scan_single_directory(&root, &dir_name, &extensions);
+            if let Some(db) = db.as_mut() {
+                let _ = db.apply_scan_unit(&unit);
+                let _ = db.finish_scan(link_raw_images);
+            }
+            let files = match &unit {
+                scan::ScanUnit::ToplevelDir { files, .. } => files.clone(),
+                scan::ScanUnit::RootFiles(files) => files.clone(),
+            };
+            let result = scan::ScanResult { files, dirs: vec![PathBuf::from(&dir_name)], elapsed: start.elapsed() };
+            sender.notice();
+            (result, db)
+        });
+        *self.scan_thread.borrow_mut() = Some(handle);
+    }
+
     /// Enables `metadata_button` only once a scan has populated the database —
     /// `project_settings.last_scan` (stamped by `finish_scan` after every completed
     /// scan) is used as the "has scan run" signal. Disabled (including while `db`
@@ -2364,34 +2448,20 @@ impl App {
     }
 
     /// The actual regenerate-events work `start_generate_events` does, factored out so
-    /// `time_correction_dialog_closed` can also call it — a time correction changes
-    /// `corrected_date_taken`, which is exactly what event clustering is keyed on, so applying
-    /// one needs events re-clustered too. Asks for confirmation first (and returns without
-    /// changing anything) if regenerating would erase already-entered titles/notes; refreshes
+    /// `time_correction_dialog_closed` and `clear_all_time_correction` can also call it — a
+    /// time correction changes `corrected_date_taken`, which is exactly what event clustering
+    /// is keyed on, so applying one needs events re-clustered too. Unlike the old
+    /// wipe-and-rebuild behavior, this only ever touches events whose membership actually
+    /// changed (see `db::events::plan`'s doc comment) — an event nothing here affects keeps
+    /// its id, title, and notes untouched, with no confirmation needed. Asks for confirmation
+    /// first (and returns without changing anything) only when the plan would actually discard
+    /// a title/notes edit on one of the events it's about to merge away or delete. Refreshes
     /// `nav_tree`'s Events node on completion either way (matching `start_generate_events`'s
-    /// original behavior of refreshing even after a failed `regenerate_events` call).
+    /// original behavior of refreshing even after a failed regeneration).
     fn regenerate_events_now(&self) {
         {
             let mut db = self.db.borrow_mut();
             let Some(db) = db.as_mut() else { return };
-
-            // Regenerating unconditionally deletes and rebuilds every event (see
-            // `db::events::regenerate`'s doc comment), which would silently erase any
-            // title/notes edit already made — ask first whenever one exists.
-            if db.has_edited_events().unwrap_or(false) {
-                let choice = nwg::modal_message(
-                    &self.window,
-                    &nwg::MessageParams {
-                        title: "PhotoMatic",
-                        content: "Regenerating events will erase any titles and notes you've entered. Continue?",
-                        buttons: nwg::MessageButtons::YesNo,
-                        icons: nwg::MessageIcons::Warning,
-                    },
-                );
-                if choice != nwg::MessageChoice::Yes {
-                    return;
-                }
-            }
 
             let images = db.list_images_for_event_generation().unwrap_or_default();
             let thresholds = self.project.borrow().event_thresholds.clone();
@@ -2403,12 +2473,40 @@ impl App {
                 multi_hour_max_distance_km: thresholds.multi_hour_max_distance_km,
             };
 
-            if let Err(err) = db.regenerate_events(&images, &db_thresholds) {
+            let plan = match db.plan_event_regeneration(&images, &db_thresholds) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    nwg::simple_message("PhotoMatic", &format!("Failed to generate events: {err}"));
+                    return;
+                }
+            };
+
+            if plan.is_destructive() {
+                let choice = nwg::modal_message(
+                    &self.window,
+                    &nwg::MessageParams {
+                        title: "PhotoMatic",
+                        content: &format!(
+                            "Regenerating events will erase the title/notes on {} event(s) that no longer cluster the \
+                             same way ({}). Continue?",
+                            plan.discarded_edited_titles.len(),
+                            plan.discarded_edited_titles.join(", "),
+                        ),
+                        buttons: nwg::MessageButtons::YesNo,
+                        icons: nwg::MessageIcons::Warning,
+                    },
+                );
+                if choice != nwg::MessageChoice::Yes {
+                    return;
+                }
+            }
+
+            if let Err(err) = db.apply_event_regeneration(plan) {
                 nwg::simple_message("PhotoMatic", &format!("Failed to generate events: {err}"));
             }
         }
 
-        // Regenerate wrote new `events`/`event_images` rows directly to the database, so
+        // Regenerating wrote new `events`/`event_images` rows directly to the database, so
         // `nav_tree`'s Events node (and `event_order`/`event_tree_items`) needs rebuilding
         // to reflect them — nothing else does this automatically after Generate Events.
         self.refresh_nav_tree();

@@ -366,7 +366,7 @@ pub struct ImageViewer {
     #[nwg_control(parent: window, text: "50%")]
     blend_value_label: nwg::Label,
 
-    #[nwg_control(parent: window, flags: "VISIBLE", background_color: Some([255, 255, 255]))]
+    #[nwg_control(parent: window, flags: "VISIBLE", background_color: Some([0, 0, 0]))]
     image_frame: nwg::ImageFrame,
 
     top_row_layout: nwg::FlexboxLayout,

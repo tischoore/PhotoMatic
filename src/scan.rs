@@ -83,6 +83,16 @@ pub fn scan_directory(root: &Path, extensions: &FileExtensions, mut on_unit: imp
     ScanResult { files, dirs, elapsed: start.elapsed() }
 }
 
+/// Scans exactly one top-level subdirectory of `root` (recursively, to any depth), without
+/// walking `root` itself or any other top-level directory — the scoped counterpart to
+/// `scan_directory`'s full walk, used by Edit > Add Camera Directory... so adding one camera
+/// doesn't require re-walking every other already-scanned directory.
+pub fn scan_single_directory(root: &Path, dir_name: &str, extensions: &FileExtensions) -> ScanUnit {
+    let mut files = Vec::new();
+    visit(root, &root.join(dir_name), extensions, dir_name, &mut files);
+    ScanUnit::ToplevelDir { name: dir_name.to_string(), files }
+}
+
 /// Recursively collects matching files under `dir`, to any depth, tagging each with
 /// the top-level directory `toplevel` they were found under.
 fn visit(root: &Path, dir: &Path, extensions: &FileExtensions, toplevel: &str, files: &mut Vec<ScannedFile>) {
@@ -242,6 +252,28 @@ mod tests {
                 assert_eq!(files[0].toplevel_dir, Some(name.clone()));
             }
         }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_single_directory_only_walks_the_named_subdirectory() {
+        let root = temp_dir("scan-single-directory");
+        let sub_a = root.join("sub_a");
+        let sub_b = root.join("sub_b");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+        std::fs::write(root.join("root.jpg"), b"").unwrap();
+        std::fs::write(sub_a.join("a.jpg"), b"").unwrap();
+        std::fs::write(sub_b.join("b.jpg"), b"").unwrap();
+
+        let unit = scan_single_directory(&root, "sub_a", &FileExtensions { jpg: true, cr2: true, gif: true });
+
+        let ScanUnit::ToplevelDir { name, files } = unit else { panic!("expected a ToplevelDir unit") };
+        assert_eq!(name, "sub_a");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, PathBuf::from("sub_a").join("a.jpg"));
+        assert_eq!(files[0].toplevel_dir, Some("sub_a".to_string()));
 
         std::fs::remove_dir_all(&root).ok();
     }
